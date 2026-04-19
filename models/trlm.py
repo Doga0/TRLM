@@ -185,6 +185,7 @@ class TRLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, response_mask: torch.Tensor, position_ids=None, mask=None):
         
         batch_size, seq_len = input_ids.shape
+        device = input_ids.device
 
         if position_ids is None:
             position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
@@ -210,6 +211,12 @@ class TRLM(nn.Module):
         
         n_sup = getattr(self.config, "n_sup", 8)  # Denoising steps per batch
         
+        total_mdm_loss = torch.tensor(0.0, device=device)
+        total_q_loss = torch.tensor(0.0, device=device)
+        ponder_times = torch.full((batch_size,), n_sup, device=device, dtype=torch.float)
+        halt_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        metrics = {}
+
         for s in range(n_sup):
             t_current = 1.0 - (s / n_sup)
             t_next = 1.0 - ((s + 1) / n_sup)
@@ -233,21 +240,29 @@ class TRLM(nn.Module):
             t_weight = 1.0 / max(t_current, 1e-5)
             resp_lengths = response_mask.sum(dim=1).float().clamp(min=1)
             
-            mdm_loss = (ce_loss * is_masked.float()).sum(dim=1) / resp_lengths * t_weight
-            mdm_loss = mdm_loss.mean()
+            step_mdm_loss = (ce_loss * is_masked.float()).sum(dim=1) / resp_lengths
+            step_mdm_loss = (step_mdm_loss * t_weight).mean()
+            total_mdm_loss += step_mdm_loss
             
-            # Halting Loss
-            r_hat = logits.argmax(dim=-1)
-            correct_tokens = (r_hat == input_ids) | ~response_mask
+            # --- Halting Loss ---
+            preds = logits.argmax(dim=-1)
+            correct_tokens = (preds == input_ids) | ~response_mask
             all_correct = correct_tokens.all(dim=1).float() # 1 if decoded sequence is perfect
-            halt_loss = F.binary_cross_entropy_with_logits(q_logits, all_correct)
             
-            step_loss = mdm_loss + getattr(self.config, "lambda_halt", 1.0) * halt_loss
-            total_loss += step_loss
+            step_q_loss = F.binary_cross_entropy_with_logits(q_logits, all_correct)
+            total_q_loss += step_q_loss
             
-            metrics[f'step_{s}_mdm_loss'] = mdm_loss.item()
-            metrics[f'step_{s}_acc'] = correct_tokens.float().mean().item()
+            # --- Step Metrics ---
+            step_acc = ((preds == input_ids) & response_mask).float().sum() / resp_lengths.sum()
+            metrics[f'step_convergence/mdm_loss_step_{s+1}'] = step_mdm_loss.item()
+            metrics[f'step_convergence/acc_step_{s+1}'] = step_acc.item()
             
+            # --- Track Ponder Time ---
+            step_halt_condition = torch.sigmoid(q_logits) > getattr(self.config, "halt_threshold", 0.5)
+            new_halts = step_halt_condition & ~halt_found
+            ponder_times[new_halts] = s + 1
+            halt_found |= new_halts
+
             # Early halting mechanism to save compute
             if (torch.sigmoid(q_logits) > getattr(self.config, "halt_threshold", 0.9)).all() and s >= 2:
                 break
@@ -256,11 +271,28 @@ class TRLM(nn.Module):
             if s < n_sup - 1:
                 with torch.no_grad():
                     # Copy-through constraint: force prompt tokens to remain correct
+                    r_hat = preds.clone()
                     r_hat[~response_mask] = input_ids[~response_mask]
                     r_t = self._low_confidence_remask(r_hat, logits, response_mask, t_next)
             
             # Detach states to prevent BPTT OOM across denoising steps
             y, z = y_det, z_det
+
+        # Normalize losses by the number of steps actually taken
+        actual_steps = s + 1
+        avg_mdm_loss = total_mdm_loss / actual_steps
+        avg_q_loss = total_q_loss / actual_steps
+        
+        lambda_halt = getattr(self.config, "lambda_halt", 1.0)
+        total_loss = avg_mdm_loss + (lambda_halt * avg_q_loss)
+        
+        # Global Metrics
+        metrics['loss/total'] = total_loss.item()
+        metrics['loss/mdm_diffusion'] = avg_mdm_loss.item()
+        metrics['loss/q_halting_bce'] = avg_q_loss.item()
+        metrics['metrics/avg_ponder_time'] = ponder_times.mean().item()
+        metrics['metrics/halt_ratio'] = halt_found.float().mean().item()
+        metrics['metrics/final_step_acc'] = metrics[f'step_convergence/acc_step_{actual_steps}']
             
         return total_loss / (s + 1), metrics
         

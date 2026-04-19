@@ -349,24 +349,52 @@ class TRLMTrainer:
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
                 steps_in_this_epoch += 1
 
+                pbar.update(1)
+
                 total_loss += step_metrics['loss']
                 for k, v in step_metrics.items():
                     epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v
                 
                 pbar.set_postfix({
-                    'loss': f"{step_metrics['loss']:.4f}",
+                    'train_loss': f"{step_metrics['loss']:.3f}",
+                    'mdm': f"{step_metrics.get('loss/mdm_diffusion', 0):.3f}",
+                    'ponder_time': f"{step_metrics.get('metrics/avg_ponder_time', 0):.1f}",
                     'lr': f"{step_metrics.get('lr', 0):.2e}",
-                    'grad_norm': f"{step_metrics.get('grad_norm', 0):.2f}"
+                    'grad_norm': f"{step_metrics.get('grad_norm', 0):.1f}",
+                    'q_halting_bce': f"{step_metrics.get('loss/q_halting_bce'):.2e}",
+                    'halt_ratio': f"{step_metrics.get('metrics/halt_ratio'):.2e}",
+                    'final_step_acc': f"{step_metrics.get('metrics/final_step_acc'):.2e}"
                 })
 
+                # log training metrics
                 log_interval = getattr(self.config, "log_interval", 50)
                 if self.global_step % log_interval == 0:
-                    self._log_metrics({
-                        'train/loss': step_metrics['loss'],
-                        'train/lr': step_metrics.get('lr', 0),
-                        'train/grad_norm': step_metrics.get('grad_norm', 0),
-                        'train/global_step': self.global_step
-                    })
+                    logs = {}
+                    for k, v in step_metrics.items():
+                        if '/' in k:
+                            category, name = k.split('/', 1)
+                            logs[f"train_{category}/{name}"] = v
+                        else:
+                            logs[f"train/{k}"] = v
+                            
+                    logs['train/global_step'] = self.global_step
+                    self._log_metrics(logs)
+
+                # run mid epoch evaluation
+                eval_interval = getattr(self.config, "eval_interval", 500)
+                if self.global_step % eval_interval == 0 and self.eval_dataloader is not None:
+                    val_metrics = self.evaluate(skip_generation=True)
+                    
+                    val_logs = {}
+                    for k, v in val_metrics.items():
+                        if '/' in k:
+                            category, name = k.split('/', 1)
+                            val_logs[f"val_{category}/{name}"] = v
+                        else:
+                            val_logs[f"val/{k}"] = v
+                            
+                    val_logs['val/global_step'] = self.global_step
+                    self._log_metrics(val_logs)
 
                 # Stop the epoch when we reach the step limit
                 if steps_in_this_epoch >= self.config.max_steps_per_epoch:
@@ -401,7 +429,6 @@ class TRLMTrainer:
             epoch_metrics = self.train_epoch()
             self.training_history.append(epoch_metrics)
 
-            # TODO: add metrics
             self.logger.info(f"Epoch {epoch + 1} Training Loss: {epoch_metrics.get('train/epoch_loss', 0):.4f}")
 
             # Evaluate
@@ -441,97 +468,8 @@ class TRLMTrainer:
 
         return best_metrics
 
-    def compute_loss(
-        self, 
-        all_logits: torch.Tensor,     # [Batch, N_sup, SeqLen, Vocab]
-        all_q_logits: torch.Tensor,   # [Batch, N_sup]
-        batch: Dict[str, torch.Tensor],
-        all_masks: torch.Tensor       # [Batch, N_sup, SeqLen] - Boolean mask of [MASK] positions
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    
-        input_ids = batch['input_ids']      # [Batch, SeqLen]
-        response_mask = batch['response_mask'] # [Batch, SeqLen] (Boolean: True for response, False for prompt)
-        
-        batch_size, n_sup, seq_len, vocab_size = all_logits.shape
-        device = all_logits.device
-
-        total_mdm_loss = torch.tensor(0.0, device=device)
-        total_q_loss = torch.tensor(0.0, device=device)
-        
-        ponder_times = torch.full((batch_size,), n_sup, device=device, dtype=torch.float)
-        halt_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        metrics = {}
-
-        for s in range(n_sup):
-            # Current timestep t (from 1.0 down to 0.0)
-            t_current = 1.0 - (s / n_sup)
-            
-            step_logits = all_logits[:, s, :, :]    # [B, L, V]
-            step_q_logits = all_q_logits[:, s]      # [B]
-            step_mask = all_masks[:, s, :]          # [B, L] (True where token was [MASK])
-
-            # MASKED DIFFUSION LOSS
-            # Calculate CE for every position
-            ce_loss = F.cross_entropy(
-                step_logits.reshape(-1, vocab_size), 
-                input_ids.reshape(-1), 
-                reduction='none'
-            ).reshape(batch_size, seq_len)
-
-            # Apply MDM Logic: Only masked positions + Only response tokens
-            active_loss_mask = step_mask & response_mask
-            
-            # Weighted by 1/t: L = -(1/tL) * sum(log p)
-            # We normalize by the number of tokens in the response
-            resp_length = response_mask.sum(dim=1).float().clamp(min=1)
-            
-            # (1/t) term
-            t_weight = 1.0 / max(t_current, 1e-4) 
-            
-            step_mdm_loss = (ce_loss * active_loss_mask.float()).sum(dim=1) / resp_length
-            step_mdm_loss = (step_mdm_loss * t_weight).mean()
-            
-            total_mdm_loss += step_mdm_loss
-
-            # HALTING LOSS
-            with torch.no_grad():
-                preds = step_logits.argmax(dim=-1)
-                # Check if all response tokens are correct
-                is_correct = ((preds == input_ids) | ~response_mask).all(dim=1).float()
-                
-            step_q_loss = F.binary_cross_entropy_with_logits(step_q_logits, is_correct)
-            total_q_loss += step_q_loss
-
-            # METRICS
-            step_acc = ((preds == input_ids) & response_mask).float().sum() / resp_length.sum()
-            metrics[f'step_convergence/mdm_loss_step_{s+1}'] = step_mdm_loss.item()
-            metrics[f'step_convergence/acc_step_{s+1}'] = step_acc.item()
-
-            # Track Ponder Time (when Q-head > 0)
-            step_halt_condition = torch.sigmoid(step_q_logits) > 0.5
-            new_halts = step_halt_condition & ~halt_found
-            ponder_times[new_halts] = s + 1
-            halt_found |= new_halts
-
-        # Final weighted loss
-        avg_mdm_loss = total_mdm_loss / n_sup
-        avg_q_loss = total_q_loss / n_sup
-        
-        lambda_halt = getattr(self.config, "lambda_halt", 1.0)
-        total_loss = avg_mdm_loss + (lambda_halt * avg_q_loss)
-
-        # Global Metrics
-        metrics['loss/total'] = total_loss.item()
-        metrics['loss/mdm_diffusion'] = avg_mdm_loss.item()
-        metrics['loss/q_halting_bce'] = avg_q_loss.item()
-        metrics['metrics/avg_ponder_time'] = ponder_times.mean().item()
-        metrics['metrics/halt_ratio'] = halt_found.float().mean().item()
-        metrics['metrics/final_step_acc'] = metrics[f'step_convergence/acc_step_{n_sup}']
-
-        return total_loss, metrics
-
     @torch.no_grad()
-    def evaluate(self):
+    def evaluate(self, skip_generation: bool = False):
     
         self.model.eval()
         val_metrics = {}
@@ -540,7 +478,7 @@ class TRLMTrainer:
         num_batches = 0
         
         # We might only want to run heavy generation (EM) on a subset to save time
-        do_generation = getattr(self.config, "eval_generation", True)
+        do_generation = getattr(self.config, "eval_generation", True) and not skip_generation
         
         pbar = tqdm(self.eval_dataloader, desc="Evaluating", dynamic_ncols=True)
         
@@ -557,8 +495,6 @@ class TRLMTrainer:
                     mask=batch.get('attention_mask')
                 )
                 
-                # loss, step_metrics = self.compute_loss(all_logits, all_q_logits, batch, all_masks)
-            
             total_loss += loss.item()
             
             # Aggregate step-wise metrics
