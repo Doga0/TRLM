@@ -23,18 +23,20 @@ class TRLMConfig:
     n_cycles: int = 6
     t_cycles: int = 3
     max_act_steps: int = 16
+    n_sup: int = 8
 
     # logging and saving
     use_tensorboard: bool = True
     save_total_limit: int = 5
     log_dir: str = "/content/drive/MyDrive/TRM/TRDM/logs"
-    log_interval: int = 50
+    log_interval: int = 1
     checkpoint_dir: str = "/content/drive/MyDrive/TRM/TRDM/checkpoints"
 
     # evaluation
-    eval_sampling_steps: int =32
+    eval_sampling_steps: int = 32
     lambda_halt: float = 1.0
-    eval_generation: bool =True
+    eval_generation: bool = True
+    eval_interval: int = 100
 
     # optimizer
     muon_lr: float = 0.001
