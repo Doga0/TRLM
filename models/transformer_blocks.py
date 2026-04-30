@@ -119,8 +119,9 @@ class Attention(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, num_heads, num_groups, max_seq_len: int = 1024):
+    def __init__(self, d_model, num_heads, num_groups, max_seq_len: int = 1024, dropout = None):
         super().__init__()
+        self.dropout = dropout
 
         assert num_heads % num_groups == 0, "num_heads must be divisible by num_groups"
 
@@ -157,7 +158,7 @@ class GroupedQueryAttention(nn.Module):
         out = F.scaled_dot_product_attention(
             q, k, v, 
             attn_mask=mask, 
-            dropout_p=0.0 if not self.training else 0.1,
+            dropout_p=0.0 if not self.training else self.dropout,
             is_causal=is_causal
         )
         
@@ -175,7 +176,8 @@ class TransformerBlock(nn.Module):
                  num_groups,
                  swiglu_intermediate_size,
                  swiglu_hidden_act,
-                 dropout
+                 attn_dropout,
+                 transformer_dropout
             ):
         super().__init__()
 
@@ -198,7 +200,8 @@ class TransformerBlock(nn.Module):
                 d_model=hidden_dim,
                 num_heads=num_heads,
                 num_groups=num_groups,
-                max_seq_len=max_seq_len
+                max_seq_len=max_seq_len,
+                dropout=attn_dropout
             )
 
         self.mlp = SwiGLU(
@@ -212,7 +215,7 @@ class TransformerBlock(nn.Module):
             eps=rms_norm_eps
         ) 
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(transformer_dropout)
 
     def forward(
         self,
