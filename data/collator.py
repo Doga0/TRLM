@@ -1,36 +1,40 @@
 import torch
 
-class TinyDiffusionRecursiveDataCollator:
-    def __init__(self, tokenizer, mask_prob_range=(0.1, 1.0)):
+class MaskingCollator:
+    def __init__(self, tokenizer, mlm_probability=0.15):
         self.tokenizer = tokenizer
-        self.mask_prob_range = mask_prob_range
-        
+        self.mlm_probability = mlm_probability
+
     def __call__(self, batch):
-        input_ids = torch.stack([b['input_ids'] for b in batch])
+        if isinstance(batch[0], dict) and "input_ids" in batch[0]:
+            input_ids = [torch.as_tensor(item["input_ids"], dtype=torch.long) for item in batch]
+        else:
+            input_ids = [torch.as_tensor(item, dtype=torch.long) for item in batch]
+
+        # Pad the sequences to the maximum length in this batch
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+
         labels = input_ids.clone()
-        batch_size, seq_len = input_ids.shape
-
-        # Sample a random masking ratio for each item in the batch
-        # This teaches the model to handle both minor edits and full generation
-        ratios = torch.empty(batch_size, 1).uniform_(*self.mask_prob_range)
         
-        # Create a boolean mask matrix
-        rand_matrix = torch.rand(batch_size, seq_len)
-        masked_indices = rand_matrix < ratios
+        # Create a probability matrix for masking
+        probability_matrix = torch.full(labels.shape, self.mlm_probability)
         
-        # Apply the [MASK] token to the input
-        input_ids[masked_indices] = self.tokenizer.mask_token_id
+        # Prevent masking of padding tokens
+        padding_mask = (labels == self.tokenizer.pad_token_id)
+        probability_matrix.masked_fill_(padding_mask, value=0.0)
         
-        # We only want to compute loss on the masked tokens
-        # Set unmasked tokens to -100 so PyTorch CrossEntropy ignores them
+        # Sample which tokens to mask
+        masked_indices = torch.bernoulli(probability_matrix).bool()
+        
+        # Labels for unmasked tokens should be -100
         labels[~masked_indices] = -100 
-
-        # This tells the model that all tokens in the sequence are part of the "response"
-        response_mask = torch.ones_like(input_ids, dtype=torch.bool)
         
+        # Replace the chosen tokens in input_ids with the [MASK] token
+        input_ids[masked_indices] = self.tokenizer.mask_token_id
+
         return {
-            "input_ids": input_ids,
-            "targets": labels,  # The original unmasked tokens
-            "attention_mask": torch.ones_like(input_ids), # bidirectional
-            "response_mask": response_mask
+            "masked_input_ids": input_ids, 
+            "labels": labels
         }
