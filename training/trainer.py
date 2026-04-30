@@ -1,9 +1,15 @@
 import os
+import sys
+from itertools import islice
 from typing import Optional, Dict, Literal, Any, List, Tuple
 from tqdm import tqdm
 import logging
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
+from tqdm.auto import tqdm
+from IPython.display import display, HTML
+
+import pandas as pd
 
 import torch
 import torch.nn as nn
@@ -145,9 +151,6 @@ class TRLMTrainer:
                  model: TRLM,
                  train_dataloader,
                  config: TRLMConfig,
-                 epochs: int,
-                 warmup_steps: int,
-                 gradient_accumulation_steps: int,
                  eval_dataloader = None
             ):
         
@@ -155,9 +158,11 @@ class TRLMTrainer:
         self.config = config
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
-        self.epochs = epochs
-        self.warmup_steps = warmup_steps
-        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.epochs = self.config.epochs
+        self.warmup_steps = self.config.warmup_steps
+        self.gradient_accumulation_steps = self.config.gradient_accumulation_steps
+        
+        self.device = next(self.model.parameters()).device
 
         self.optimizer = self._setup_optimizer()
         
@@ -166,8 +171,12 @@ class TRLMTrainer:
         self.logger = self._setup_logger()
         self.writer = self._setup_tensorboard()
 
+        ema_decay = getattr(config, "ema_decay", 0.9999)
+        self.ema = EMAModel(self.model, decay=ema_decay, device=self.device)
+
         self.global_step = 0
         self.current_epoch = 0
+        self.tokens_seen = 0
         self.best_val_loss = float('inf')
         self.training_history: List[Dict[str, float]] = []
 
@@ -265,12 +274,15 @@ class TRLMTrainer:
         logger = logging.getLogger("TRLMTrainer")
         logger.setLevel(logging.INFO)
 
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-            ))
-            logger.addHandler(handler)
+        logger.propagate = False
+
+        if logger.handlers:
+            logger.handlers.clear()
+
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+
+        logger.addHandler(handler)
 
         return logger
 
@@ -278,63 +290,79 @@ class TRLMTrainer:
         """Setup TensorBoard writer."""
         if not self.config.use_tensorboard or not TENSORBOARD_AVAILABLE:
             return None
+        
+        os.makedirs(self.config.log_dir, exist_ok=True)
 
-        return SummaryWriter(log_dir=self.config.log_dir)
+        return SummaryWriter(log_dir=self.config.log_dir, flush_secs=5)
 
     def _log_metrics(self, metrics: Dict[str, float]):
         """Log metrics to all configured destinations."""
-        self.logger.info(f"Step {self.global_step}: {metrics}")
 
         # TensorBoard
         if self.writer is not None:
             for key, value in metrics.items():
                 self.writer.add_scalar(key, value, self.global_step)
 
-    def train_step(self, batch: Dict[str, torch.Tensor], batch_idx: int):
+    def train_step(self, batch: Dict[str, torch.Tensor], step_idx: int):
+        """
+        Executes a single training iteration: forward pass, backward pass, and 
+        conditional optimizer step based on gradient accumulation.
+        """
+
         batch = self._move_to_device(batch)
+        masked_input_ids = batch["masked_input_ids"]
+        labels = batch["labels"]
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            loss, metrics = self.model(
-                input_ids=batch['input_ids'],
-                response_mask=batch['response_mask'],
-                position_ids=batch.get('position_ids'),
-                mask=batch.get('attention_mask')
+            logits, loss, lm_loss, q_loss, recursion_depth = self.model(
+                masked_input_ids=masked_input_ids,
+                labels=labels
             )
 
-            # loss, metrics = self.compute_loss(all_logits, all_q_logits, batch, all_masks)
+            scaled_loss = loss / self.config.gradient_accumulation_steps
 
-            # Scale loss for gradient accumulation
-            loss = loss / self.gradient_accumulation_steps
+        scaled_loss.backward()
 
-        loss.backward()
-
-        metrics['loss'] = loss.item() * self.gradient_accumulation_steps
-
-        if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+        # Optimizer Step
+        grad_norm = 0.0
+        if (step_idx + 1) % self.config.gradient_accumulation_steps == 0:
             
             # Gradient clipping
-            max_grad_norm = getattr(self.config, "max_grad_norm", 1.0)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), max_grad_norm
-            )
-            metrics['grad_norm'] = grad_norm.item()
+            max_grad_norm = getattr(self.config, 'max_grad_norm', 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_grad_norm).item()
 
             self.optimizer.step()
             self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad()
+
+            # Update EMA 
+            if self.ema is not None:
+                self.ema.update()
 
             self.global_step += 1
 
-            metrics['lr'] = self.scheduler.get_last_lr()[0]
+        safe_lm_loss = torch.clamp(lm_loss, max=20.0) 
+        perplexity = torch.exp(safe_lm_loss).item()
 
-        return metrics
+        return {
+            "loss": loss.item(),
+            "lm_loss": lm_loss.item(),
+            "q_loss": q_loss.item(),
+            "perplexity": perplexity,
+            "recursion_depth": recursion_depth,
+            "grad_norm": grad_norm,
+            "batch_tokens": masked_input_ids.numel() # Total tokens processed
+        }
 
     def train_epoch(self):
+        """
+        Runs one complete pass over the training dataset.
+        Handles progress tracking, logging, periodic evaluation, and checkpointing.
+        """
+        
         self.model.train()
         
-        epoch_metrics = {}
         total_loss = 0.0
-        steps_in_this_epoch = 0
 
         pbar = tqdm(
             total=self.config.max_steps_per_epoch,
@@ -342,195 +370,220 @@ class TRLMTrainer:
             dynamic_ncols=True
         )
 
-        for batch_idx, batch in enumerate(self.train_dataloader):
+        for step_idx, batch in enumerate(
+                islice(self.train_dataloader, self.config.max_steps_per_epoch)
+        ):
             
-            step_metrics = self.train_step(batch, batch_idx)
+            step_metrics = self.train_step(batch, step_idx)
+            
+            total_loss += step_metrics["loss"]
+            self.tokens_seen += step_metrics["batch_tokens"]
+            ppl = step_metrics["perplexity"]
 
-            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
-                steps_in_this_epoch += 1
+            avg_loss = total_loss / (step_idx + 1)
+
+            pbar.update(1)
+
+            pbar.set_postfix({
+                'step': self.global_step,
+                'loss': f"{avg_loss:.4f}",
+                'lm_loss': f"{step_metrics['lm_loss']:.4e}",
+                'q_loss': f"{step_metrics['q_loss']:.4e}",
+                'ppl': f"{ppl:.4f}",
+                'grad_norm': f"{step_metrics['grad_norm']:.4e}",
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.4e}",
+                'depth': f"{step_metrics['recursion_depth']}"
+            })
+
+            is_opt_step = (step_idx + 1) % self.config.gradient_accumulation_steps == 0
+
+            if is_opt_step:
+                
+                if self.global_step % getattr(self.config, 'logging_steps', 10) == 0:
+                    
+                    log_dict = {
+                        "Train/Loss": avg_loss,
+                        "Train/Lm_loss": f"{step_metrics['lm_loss']:.4e}",
+                        "Train/Q_loss": f"{step_metrics['q_loss']:.4e}",
+                        "Train/Perplexity": ppl,
+                        "Train/LearningRate": self.optimizer.param_groups[0]['lr'],
+                        "Metrics/RecursionDepth": step_metrics["recursion_depth"],
+                        "Metrics/TokensSeen": self.tokens_seen
+                    }
+
+                    log_dict["Metrics/GradNorm"] = step_metrics["grad_norm"]
+
+                    self._log_metrics(log_dict)
+
+                    self.logger.info(
+                        f"Step {self.global_step} | Loss: {avg_loss:.4f} | "
+                        f"Lm_loss: {step_metrics['lm_loss']:.4e} | "
+                        f"Q_loss: {step_metrics['q_loss']:.4e} | "
+                        f"Ppl: {ppl} | "
+                        f"Grad norm: {step_metrics['grad_norm']} | "
+                        f"Depth: {step_metrics['recursion_depth']} | "
+                        f"Tokens: {self.tokens_seen:.2e}"
+                    )
+                
+                # Evaluation
+                if self.global_step % getattr(self.config, 'eval_interval', 10) == 0:
+                    val_loss, epoch_val_ppl = self.evaluate()
+
+                    self.logger.info(f"Step {self.global_step} Validation Loss: {val_loss:.4f} | Perplexity: {epoch_val_ppl:.2f}")
+
+                    self._log_metrics({
+                        "Eval/Loss": val_loss,
+                        "Eval/Perplexity": epoch_val_ppl
+                    })
+                    
+                    self.model.train() 
+                    
+                    # Check if this is the best model so far
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+                        self.save_checkpoint(is_best=True)
+                
+                # Checkpointing
+                if self.global_step % getattr(self.config, 'save_steps', 1000) == 0:
+                    self.save_checkpoint()
+
+        pbar.close()
+        
+        return total_loss / self.config.max_steps_per_epoch
+
+    def train(self, resume_from_checkpoint: str = None):
+        """
+        The main entry point for the training loop.
+        Handles epoch iteration, resuming from checkpoints, and shutdowns.
+        """
+
+        # Resume from checkpoint if provided
+        if resume_from_checkpoint:
+            self.load_checkpoint(resume_from_checkpoint)
+            self.logger.info(f"Resuming training from epoch {self.current_epoch}, step {self.global_step}")
+        else:
+            self.logger.info("Starting training from scratch.")
+
+        self.logger.info(f"Total Epochs: {getattr(self.config, 'epochs', 5)}")
+        self.logger.info(f"Gradient Accumulation Steps: {self.config.gradient_accumulation_steps}")
+
+        try:
+            for epoch in range(self.current_epoch, getattr(self.config, 'epochs', 5)):
+                self.current_epoch = epoch
+                
+                self.logger.info(f"\n{'='*40}\nStarting Epoch {epoch+1}/{getattr(self.config, 'epochs', 5)}\n{'='*40}")
+
+                # execute epoch
+                epoch_train_loss = self.train_epoch()
+
+                self.logger.info(f"Epoch {epoch+1} completed. Average Training Loss: {epoch_train_loss:.4f}")
+
+                # End-of-Epoch Evaluation
+                epoch_val_loss, epoch_val_ppl = self.evaluate()
+    
+                self.logger.info(f"Epoch {epoch+1} Validation Loss: {epoch_val_loss:.4f} | Perplexity: {epoch_val_ppl:.2f}")
+
+                self._log_metrics({
+                    "Eval/Loss": epoch_val_loss,
+                    "Eval/Perplexity": epoch_val_ppl
+                })
+
+                # Update best model state
+                if epoch_val_loss < self.best_val_loss:
+                    self.best_val_loss = epoch_val_loss
+                    self.save_checkpoint(is_best=True)
+                    self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}. Saved best model.")
+
+                self.save_checkpoint()
+
+                # Record history
+                if not hasattr(self, 'training_history'):
+                    self.training_history = []
+                    
+                self.training_history.append({
+                    'epoch': epoch + 1,
+                    'train_loss': epoch_train_loss,
+                    'val_loss': epoch_val_loss,
+                    'global_step': self.global_step
+                })
+
+            self.logger.info("Training completed successfully!")
+            self.save_checkpoint(is_final=True)
+
+            # EMA Finalization
+            if self.ema is not None:
+                self.logger.info("Applying EMA shadow weights to model for final artifact.")
+                self.ema.copy_to_model()
+                self.save_checkpoint(is_final=True) # Overwrite final checkpoint with smoothed weights
+
+            if self.writer is not None:
+                self.writer.close() 
+
+        except KeyboardInterrupt:
+            self.logger.warning("\nTraining interrupted by user (KeyboardInterrupt)!")
+            self.logger.info("Saving emergency checkpoint before exiting...")
+            
+            self.save_checkpoint()
+            
+            self.logger.info("Emergency checkpoint saved. Exiting gracefully.")
+
+    @torch.no_grad()
+    def evaluate(self):
+        """
+        Evaluates the model on the validation dataset using the Mask-Predict strategy.
+        Temporarily applies EMA shadow weights if available for a smoother, 
+        more generalized evaluation metric.
+        """
+
+        self.model.eval()
+
+        using_ema = hasattr(self, 'ema') and self.ema is not None
+        if using_ema:
+            self.ema.apply_shadow()
+
+        total_val_loss = 0.0
+
+        pbar = tqdm(
+            self.eval_dataloader,
+            desc="Evaluating",
+            dynamic_ncols=True,
+            total=self.config.eval_steps,
+            leave=False
+        )
+
+        try:
+            for batch_idx, batch in enumerate(self.eval_dataloader):
+                if batch_idx >= self.config.eval_steps:
+                    break
+                
+                batch = self._move_to_device(batch)
 
                 pbar.update(1)
 
-                total_loss += step_metrics['loss']
-                for k, v in step_metrics.items():
-                    epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v
+                masked_input_ids = batch["masked_input_ids"]
+                labels = batch["labels"]
+
+                # Forward 
+                with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                    logits, loss, lm_loss, q_loss, recursion_depth = self.model(
+                        masked_input_ids=masked_input_ids,
+                        labels=labels
+                    )
+
+                total_val_loss += loss.item()
+                total_val_lm_loss += lm_loss.item()
                 
-                pbar.set_postfix({
-                    'train_loss': f"{step_metrics['loss']:.3f}",
-                    'mdm': f"{step_metrics.get('loss/mdm_diffusion', 0):.3f}",
-                    'ponder_time': f"{step_metrics.get('metrics/avg_ponder_time', 0):.1f}",
-                    'lr': f"{step_metrics.get('lr', 0):.2e}",
-                    'grad_norm': f"{step_metrics.get('grad_norm', 0):.1f}",
-                    'q_halting_bce': f"{step_metrics.get('loss/q_halting_bce'):.2e}",
-                    'halt_ratio': f"{step_metrics.get('metrics/halt_ratio'):.2e}",
-                    'final_step_acc': f"{step_metrics.get('metrics/final_step_acc'):.2e}"
-                })
+            pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
 
-                # log training metrics
-                log_interval = getattr(self.config, "log_interval", 50)
-                if self.global_step % log_interval == 0:
-                    logs = {}
-                    for k, v in step_metrics.items():
-                        if '/' in k:
-                            category, name = k.split('/', 1)
-                            logs[f"train_{category}/{name}"] = v
-                        else:
-                            logs[f"train/{k}"] = v
-                            
-                    logs['train/global_step'] = self.global_step
-                    self._log_metrics(logs)
-
-                # run mid epoch evaluation
-                eval_interval = getattr(self.config, "eval_interval", 500)
-                if self.global_step % eval_interval == 0 and self.eval_dataloader is not None:
-                    val_metrics = self.evaluate(skip_generation=True)
-                    
-                    val_logs = {}
-                    for k, v in val_metrics.items():
-                        if '/' in k:
-                            category, name = k.split('/', 1)
-                            val_logs[f"val_{category}/{name}"] = v
-                        else:
-                            val_logs[f"val/{k}"] = v
-                            
-                    val_logs['val/global_step'] = self.global_step
-                    self._log_metrics(val_logs)
-
-                # Stop the epoch when we reach the step limit
-                if steps_in_this_epoch >= self.config.max_steps_per_epoch:
-                    break
-                
-        pbar.close()
-
-        denom = max(1, len(self.train_dataloader))
-        avg_epoch_metrics = {k: v / denom for k, v in epoch_metrics.items()}
-        avg_epoch_metrics['train/epoch_loss'] = total_loss / denom
-        
-        return avg_epoch_metrics
-
-    def train(self):
-        self.logger.info(f"Starting TRLM Training")
-        self.logger.info(f"Total Epochs: {self.epochs}")
-        self.logger.info(f"Gradient Accumulation Steps: {self.gradient_accumulation_steps}")
-
-        self.device = next(self.model.parameters()).device
-
-        best_metrics = {}
-        patience_counter = 0
-        early_stopping_patience = getattr(self.config, "early_stopping_patience", -1)
-
-        # Ensure gradients are zeroed before starting
-        self.optimizer.zero_grad(set_to_none=True)
-
-        for epoch in range(self.epochs):
-            self.current_epoch = epoch
-
-            # Train for one epoch
-            epoch_metrics = self.train_epoch()
-            self.training_history.append(epoch_metrics)
-
-            self.logger.info(f"Epoch {epoch + 1} Training Loss: {epoch_metrics.get('train/epoch_loss', 0):.4f}")
-
-            # Evaluate
-            if self.eval_dataloader is not None:
-                val_metrics = self.evaluate()
-
-                for k, v in val_metrics.items():
-                    self._log_metrics({f"val/{k}": v})
-
-                self.logger.info(f"Epoch {epoch + 1} Validation Loss: {val_metrics['loss']:.4f}")
+            avg_val_loss = total_val_loss / self.config.eval_steps
+            avg_val_lm_loss = total_val_lm_loss / self.config.eval_steps
             
-                # Checkpointing & Early Stopping Logic
-                if val_metrics['loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['loss']
-                    best_metrics = val_metrics.copy()
-                    
-                    self.save_checkpoint(is_best=True)
-                    patience_counter = 0
-                    self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}. Checkpoint saved.")
-                else:
-                    patience_counter += 1
+            val_perplexity = torch.exp(torch.tensor(avg_val_lm_loss)).item()
 
-                if 0 < early_stopping_patience <= patience_counter:
-                    self.logger.info(f"Early stopping triggered after {epoch + 1} epochs without improvement.")
-                    break
+        finally:
+            self.ema.restore()
 
-            else:
-                save_every_epoch = getattr(self.config, "save_every_epoch", True)
-                if save_every_epoch:
-                    self.save_checkpoint(is_best=False)
-
-        self.save_checkpoint(is_final=True)
-        self.logger.info("Training complete.")
-
-        if self.writer is not None:
-            self.writer.close()
-
-        return best_metrics
-
-    @torch.no_grad()
-    def evaluate(self, skip_generation: bool = False):
-    
-        self.model.eval()
-        val_metrics = {}
-        total_loss = 0.0
-        total_exact_match = 0.0
-        num_batches = 0
-        
-        # We might only want to run heavy generation (EM) on a subset to save time
-        do_generation = getattr(self.config, "eval_generation", True) and not skip_generation
-        
-        pbar = tqdm(self.eval_dataloader, desc="Evaluating", dynamic_ncols=True)
-        
-        for batch in pbar:
-            batch = self._move_to_device(batch)
-            num_batches += 1
-            
-            # Forward Pass (Deep Supervision / Step-wise Loss)
-            with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                loss, step_metrics = self.model(
-                    input_ids=batch['input_ids'],
-                    response_mask=batch['response_mask'],
-                    position_ids=batch.get('position_ids'),
-                    mask=batch.get('attention_mask')
-                )
-                
-            total_loss += loss.item()
-            
-            # Aggregate step-wise metrics
-            for k, v in step_metrics.items():
-                val_metrics[k] = val_metrics.get(k, 0.0) + v
-
-            # Generative Pass (Exact Match / Final Performance)
-            # This is the "Inference" mode. It starts from [MASK] and iteratively solves.
-            if do_generation:
-                
-                prompt_len = (~batch['response_mask']).sum(dim=1).min().item()
-                prompts = batch['input_ids'][:, :prompt_len]
-                
-                # Run the Diffusion Sampling Loop
-                generated_response = self.model.generate(
-                    prompt_ids=prompts,
-                    max_response_len=batch['input_ids'].size(1) - prompt_len,
-                    num_steps=getattr(self.config, "eval_sampling_steps", 32)
-                )
-                
-                # Compare generated vs ground truth response
-                target_response = batch['input_ids'][:, prompt_len:]
-                
-                # Exact Match: Every token in the response must be correct
-                is_correct = (generated_response == target_response).all(dim=1)
-                total_exact_match += is_correct.float().mean().item()
-
-        avg_val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
-        avg_val_metrics['loss'] = total_loss / num_batches
-        
-        if do_generation:
-            avg_val_metrics['exact_match_ratio'] = total_exact_match / num_batches
-            self.logger.info(f"Validation Exact Match (EM): {avg_val_metrics['exact_match_ratio']:.2%}")
-
-        self.model.train()
-        return avg_val_metrics
+        return avg_val_loss, val_perplexity
 
     def save_checkpoint(self, is_best: bool = False, is_final: bool = False):
         
@@ -541,6 +594,8 @@ class TRLMTrainer:
             checkpoint_name = "checkpoint_final.pt"
         else:
             checkpoint_name = f"checkpoint_step_{self.global_step}.pt"
+
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
 
         checkpoint_path = Path(self.config.checkpoint_dir) / checkpoint_name
 
