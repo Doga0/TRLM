@@ -10,8 +10,9 @@ class TRLMConfig:
     max_seq_len: int = 1024
     num_layers: int = 2
     rms_norm_eps: float = 1e-6
-    dropout: float = 0.0
     attn: str = "gqa"
+    attn_dropout: float = 0.1
+    transformer_dropout: float = 0.1
 
     mask_token_id: int = -1
 
@@ -20,23 +21,26 @@ class TRLMConfig:
     swiglu_hidden_act: str = "silu"
 
     # TRM recursion params
-    n_cycles: int = 6
-    t_cycles: int = 3
+    max_supervision_steps: int = 16
+    thinking_steps: int = 2
     max_act_steps: int = 16
     n_sup: int = 8
+    halt_threshold: float = 0.7
 
     # logging and saving
     use_tensorboard: bool = True
     save_total_limit: int = 5
-    log_dir: str = "/content/drive/MyDrive/TRM/TRDM/logs"
-    log_interval: int = 1
-    checkpoint_dir: str = "/content/drive/MyDrive/TRM/TRDM/checkpoints"
+    log_dir: str = "/content/drive/MyDrive/TRM/TRLM/logs"
+    logging_steps: int = 1
+    checkpoint_dir: str = "/content/drive/MyDrive/TRM/TRLM/checkpoints"
 
     # evaluation
     eval_sampling_steps: int = 32
     lambda_halt: float = 1.0
     eval_generation: bool = True
-    eval_interval: int = 100
+    eval_interval: int = 30
+    eval_steps: int = 1000
+    save_steps: int = 50
 
     # optimizer
     muon_lr: float = 0.001
@@ -53,4 +57,10 @@ class TRLMConfig:
     early_stopping_patience: int = 20
     save_every_epoch: bool = True
     max_steps_per_epoch: int = 1000 
-    steps_per_epoch: int = 2000 
+    gradient_accumulation_steps: int = 16
+    q_loss_weight: float = 0.5
+    warmup_steps: int = 200
+    epochs: int = 5
+
+    # ema
+    ema_decay: float = 0.999
