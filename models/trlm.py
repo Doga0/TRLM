@@ -16,35 +16,135 @@ from models.utils import trunc_normal_init_
 from configs.config import TRLMConfig
 
 
-class QHead(nn.Module):
+@dataclass
+class SentenceACTState:
+    halted: torch.Tensor          # (B,)
+    halt_prob_accum: torch.Tensor # (B,)
+    remainders: torch.Tensor      # (B,)
+    n_updates: torch.Tensor       # (B,)
+    output_accum: torch.Tensor    # (B, T, C)
 
-    def __init__(self, embed_dim: int, hidden_dim: Optional[int] = None):
+
+class ACTHalting(nn.Module):
+    def __init__(self, hidden_dim: int, halt_threshold: float = 1.0 - 1e-6):
         super().__init__()
-        hidden_dim = hidden_dim or embed_dim
+        self.halt_head = nn.Linear(hidden_dim, 1)
+        self.halt_threshold = halt_threshold
 
-        self.norm = RMSNorm(embed_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
+    def init_state(self, B, T, C, device):
+        return SentenceACTState(
+            halted=torch.zeros(B, dtype=torch.bool, device=device),
+            halt_prob_accum=torch.zeros(B, device=device),
+            remainders=torch.zeros(B, device=device),
+            n_updates=torch.zeros(B, device=device),
+            output_accum=torch.zeros(B, T, C, device=device),
         )
 
-        # Initialize output to predict 0 initially
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+    def step(
+        self,
+        x: torch.Tensor,  # (B, T, C)
+        state: SentenceACTState
+    ) -> Tuple[SentenceACTState, bool]:
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        
-        z = self.norm(z)
-        # Global average pooling over sequence
-        z_pooled = z.mean(dim=1)
-        # Predict halting probability
-        q_hat = self.mlp(z_pooled).squeeze(-1)
-        return q_hat
+        # sentence representation
+        h = x[:, 0, :]  # (B, C) TODO: use attention pooling
+
+        halt_logits = self.halt_head(h).squeeze(-1)  # (B,)
+        halt_prob = torch.sigmoid(halt_logits)
+
+        still_running = ~state.halted
+
+        # check halting condition
+        should_halt = (state.halt_prob_accum + halt_prob >= self.halt_threshold)
+
+        new_halted = should_halt & still_running
+
+        # compute remainders
+        remainders = torch.where(
+            new_halted,
+            1.0 - state.halt_prob_accum,
+            state.remainders
+        )
+
+        # compute step weight
+        p = torch.where(
+            new_halted,
+            remainders,
+            torch.where(still_running, halt_prob, torch.zeros_like(halt_prob))
+        )
+
+        # expand to sequence
+        p_expanded = p.view(-1, 1, 1)
+
+        output_accum = state.output_accum + p_expanded * x
+
+        halt_prob_accum = torch.where(
+            still_running & ~new_halted,
+            state.halt_prob_accum + halt_prob,
+            state.halt_prob_accum
+        )
+
+        n_updates = state.n_updates + still_running.float()
+        halted = state.halted | new_halted
+
+        new_state = SentenceACTState(
+            halted=halted,
+            halt_prob_accum=halt_prob_accum,
+            remainders=remainders,
+            n_updates=n_updates,
+            output_accum=output_accum,
+        )
+
+        return (
+            new_state,
+            halted.all().item(),
+            halt_logits.unsqueeze(-1),   # (B, 1)
+            halt_prob.unsqueeze(-1),    # (B, 1)
+            should_halt.unsqueeze(-1)       # (B, 1)
+        )
+
+    def finalize(
+        self,
+        x: torch.Tensor,
+        state: SentenceACTState
+    ):
+        still_running = ~state.halted
+
+        remainders = torch.where(
+            still_running,
+            1.0 - state.halt_prob_accum,
+            state.remainders
+        )
+
+        p_expanded = remainders.view(-1, 1, 1)
+
+        output = state.output_accum + (still_running.float().view(-1,1,1) * p_expanded) * x
+
+        ponder_cost = (state.n_updates + remainders).mean()
+
+        return output, ponder_cost
+    
+class BinaryACTHalting(nn.Module):
+    def __init__(self, hidden_dim, halt_threshold=0.9):
+        super().__init__()
+        self.halt_head = nn.Linear(hidden_dim, 1)
+        self.halt_threshold = halt_threshold
+
+    def forward(self, x):
+        h = x.mean(dim=1)
+        logits = self.halt_head(h).squeeze(-1)
+        prob = torch.sigmoid(logits)
+        return prob, logits
+
+    def should_halt(self, prob):
+        return prob.mean() > self.halt_threshold
 
 class ReasoningModule(nn.Module):
     def __init__(self, config: TRLMConfig):
         super().__init__()
+
+        # Projects the concatenated x, y, and z states back to hidden_dim.
+        self.combiner = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
 
         self.layers = nn.ModuleList([
             TransformerBlock(
@@ -56,26 +156,61 @@ class ReasoningModule(nn.Module):
                 num_groups=config.num_groups,
                 swiglu_intermediate_size=config.swiglu_intermediate_size,
                 swiglu_hidden_act=config.swiglu_hidden_act,
-                dropout=config.dropout
+                attn_dropout=config.attn_dropout,
+                transformer_dropout=config.transformer_dropout
             ) for _ in range(config.num_layers)
         ])
 
+        self.num_recursions = getattr(config, 'num_recursions', 3)
+
+        self.gate = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.norm = nn.LayerNorm(config.hidden_dim, eps=config.rms_norm_eps)
+
+        with torch.no_grad():
+            self.gate.weight.zero_()
+            self.gate.bias.fill_(-2.0) 
+
     def forward(
         self, 
-        state: torch.Tensor, 
-        injection: torch.Tensor, 
-        position_ids: torch.Tensor, 
-        mask: Optional[torch.Tensor] = None, 
-        is_causal: bool = False
+        x: torch.Tensor, 
+        y: torch.Tensor, 
+        z: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         
-        # TODO: try learned gating mechanism
-        x = 0.5 * state + 0.5 * injection
-        
-        for layer in self.layers:
-            x = layer(x, position_ids=position_ids, mask=mask, is_causal=is_causal)
+        batch_size, seq_len, hidden_dim = x.shape
+
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
+
+        n = self.num_recursions
+
+        # Initialize z state to zeros if this is the very first step
+        if z is None:
+            z = torch.zeros_like(x, device=x.device, dtype=x.dtype)
+
+        # If 'y' is a single pooled state (Batch, Dim), broadcast it to sequence length
+        if y.dim() == 2:
+            y = y.unsqueeze(1).expand(-1, seq_len, -1)
+
+        # Latent Recursion Loop: refine z 'n' times
+        for _ in range(n):
+            # Combine Input (x), Answer State (y), and Reasoning State (z)
+            combined = torch.cat([x, y, z], dim=-1)     # [Batch, SeqLen, HiddenDim * 3]
+            hidden_state = self.combiner(combined)      # [Batch, SeqLen, HiddenDim]
             
-        return x
+            # Pass through the transformer stack
+            for layer in self.layers:
+                hidden_state = layer(hidden_state, position_ids=position_ids)
+                
+            # Residual update: add the network's output to the existing z state.
+            # z = z + hidden_state
+
+            # Apply gating to prevents explosion in deep recursion
+            gate = torch.sigmoid(self.gate(hidden_state))   # (B, T, C)
+
+            # Residual update
+            z = z + gate * hidden_state
+            
+        return z
 
 class TRLM(nn.Module):
     def __init__(self, config: TRLMConfig):
@@ -88,9 +223,13 @@ class TRLM(nn.Module):
 
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
 
-        self.q_head = QHead(embed_dim=config.hidden_dim)
+        self.halting = BinaryACTHalting(hidden_dim=config.hidden_dim, halt_threshold=config.halt_threshold)
 
         self.reasoning_module = ReasoningModule(config)
+
+        self.answer_combiner = nn.Linear(config.hidden_dim * 2, config.hidden_dim)
+
+        self.final_norm = nn.LayerNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
         self.apply(self._init_weights)
 
@@ -101,247 +240,143 @@ class TRLM(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _initialize_states(self, input_ids):
+        """Initializes the x (input), y (answer), and z (reasoning) states."""
+        x = self.embed_tokens(input_ids)
+        y = torch.zeros_like(x)
+        z = torch.zeros_like(x)
+        return x, y, z
     
-    def _latent_recursion(
-        self, 
-        x_emb: torch.Tensor, 
-        z_H: torch.Tensor, 
-        z_L: torch.Tensor, 
-        position_ids: torch.Tensor, 
-        mask: Optional[torch.Tensor], 
-        is_causal: bool
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _update_answer_state(self, y, z):
+        """Updates the answer state 'y' using the reasoning state 'z'."""
+        combined = torch.cat([y, z], dim=-1)           # [B, S, H*2]
+        h = self.answer_combiner(combined)             # [B, S, H]
+
+        seq_len = h.size(1)
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=h.device).unsqueeze(0)
         
-        # Recursive Latent Reasoning: Update z_L n times
-        # z_L <- f(z_L + (x_emb + z_H))
-        for _ in range(self.config.n_cycles):
-            z_L = self.reasoning_module(
-                state=z_L, 
-                injection=x_emb + z_H, 
-                position_ids=position_ids, 
-                mask=mask, 
-                is_causal=is_causal
-            )
+        # Pass through the shared transformer blocks to leverage shared weights
+        for layer in self.reasoning_module.layers:
+            h = layer(h, position_ids=position_ids)
             
-        # Refine Output Answer: Update z_H 1 time
-        # z_H <- f(z_H + z_L)
-        z_H = self.reasoning_module(
-            state=z_H, 
-            injection=z_L, 
-            position_ids=position_ids, 
-            mask=mask, 
-            is_causal=is_causal
+        return y + h  # Residual connection for stability
+    
+    def _compute_step_loss(
+            self, 
+            logits: torch.Tensor, 
+            labels: torch.Tensor, 
+            halt_logits: torch.Tensor
+        ):
+
+        lm_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            ignore_index=-100 
         )
+
+        # Q-Loss (Halting): We only calculate accuracy on the masked positions
+        mask_positions = (labels != -100)
+        if mask_positions.any():
+            correct_predictions = (logits.argmax(-1)[mask_positions] == labels[mask_positions]).float()
+            is_correct = correct_predictions.mean()
+                    
+            q_loss = F.binary_cross_entropy_with_logits(
+                halt_logits, is_correct.expand_as(halt_logits)
+            )
         
-        return z_H, z_L
-    
-    def _deep_recursion(
-        self, 
-        x_emb: torch.Tensor, 
-        z_H: torch.Tensor, 
-        z_L: torch.Tensor,
-        position_ids: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        is_causal: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        step_total_loss = lm_loss + (self.config.q_loss_weight * q_loss)
         
-        # T-1 loops without gradients to improve y (z_H) and z (z_L) efficiently
-        with torch.no_grad():
-            for _ in range(self.config.t_cycles - 1):
-                z_H, z_L = self._latent_recursion(x_emb, z_H, z_L, position_ids, mask, is_causal)
-        
-        # 1 loop with gradients for backpropagation
-        z_H, z_L = self._latent_recursion(x_emb, z_H, z_L, position_ids, mask, is_causal)
-        
-        # Detach states for the next supervision step to avoid OOM
-        z_H_detached = z_H.detach()
-        z_L_detached = z_L.detach()
-        
-        return z_H_detached, z_L_detached, z_H, z_L
-    
-    def _low_confidence_remask(self, r_hat, logits, response_mask, target_t):
-        batch_size, seq_len = r_hat.shape
-        r_next = r_hat.clone()
-        
-        # Calculate confidences
-        probs = torch.softmax(logits, dim=-1)
-        confidences, _ = probs.max(dim=-1)
-        
-        # We only want to mask response tokens
-        confidences[~response_mask] = float('inf')
-        
-        # Number of tokens to mask per sequence
-        resp_lengths = response_mask.sum(dim=1).float()
-        num_to_mask = (resp_lengths * target_t).long()
-        
-        for i in range(batch_size):
-            k = num_to_mask[i].item()
-            if k > 0:
-                _, indices = torch.topk(confidences[i], k, largest=False)
-                r_next[i, indices] = self.mask_token_id
+        return lm_loss, q_loss, step_total_loss
+
+    def forward(self, masked_input_ids, labels=None):
+        x, y, z = self._initialize_states(masked_input_ids)
+
+        accumulated_loss = 0.0
+        accumulated_lm_loss = 0.0
+        accumulated_q_loss = 0.0
+        final_logits = None
+        recursion_depth = 0
+
+        for step in range(self.config.max_supervision_steps):
+            recursion_depth = step + 1
+            
+            # Phase 1: Exploration (T-1 iterations without gradients)
+            with torch.no_grad():
+                for _ in range(self.config.thinking_steps):
+                    z = self.reasoning_module(x, y, z)
+                    y = self._update_answer_state(y, z)
+
+            # Phase 2: Supervision (1 final recursion with gradients)
+            z = self.reasoning_module(x, y, z)
+            y = self._update_answer_state(y, z)
+
+            normalized_y = self.final_norm(y)
+
+            logits = self.lm_head(normalized_y)
+            prob, halt_logits = self.halting(normalized_y)
+            final_logits = logits
+
+            if labels is not None:
+                step_lm, step_q, step_total = self._compute_step_loss(
+                    logits=logits, labels=labels, halt_logits=halt_logits
+                )
                 
-        return r_next
+                accumulated_loss += step_total
+                accumulated_lm_loss += step_lm
+                accumulated_q_loss += step_q
 
-    def forward(self, input_ids: torch.Tensor, response_mask: torch.Tensor, position_ids=None, mask=None):
-        
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-        
-        if mask is not None:
-            mask = mask.to(torch.bool)
-            
-            if mask.dim() == 2:
-                mask = mask.unsqueeze(1).unsqueeze(2)
-
-        # Initialize fully masked response
-        r_t = input_ids.clone()
-        r_t[response_mask] = self.mask_token_id
-        
-        # State Initialization
-        x_emb = self.embed_tokens(r_t)
-        y = x_emb.clone()
-        z = torch.zeros_like(y)
-        
-        total_loss = 0.0
-        metrics = {}
-        
-        n_sup = getattr(self.config, "n_sup", 8)  # Denoising steps per batch
-        
-        total_mdm_loss = torch.tensor(0.0, device=device)
-        total_q_loss = torch.tensor(0.0, device=device)
-        ponder_times = torch.full((batch_size,), n_sup, device=device, dtype=torch.float)
-        halt_found = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        metrics = {}
-
-        for s in range(n_sup):
-            t_current = 1.0 - (s / n_sup)
-            t_next = 1.0 - ((s + 1) / n_sup)
-            
-            x_emb = self.embed_tokens(r_t)
-            
-            # Deep Recursion
-            y_det, z_det, y_grad, z_grad = self._deep_recursion(x_emb, y, z, position_ids, mask, is_causal=False)
-            
-            logits = self.lm_head(y_grad)
-            q_logits = self.q_head(y_grad)
-            
-            # Masked Diffusion Loss
-            is_masked = (r_t == self.mask_token_id) & response_mask
-            ce_loss = F.cross_entropy(
-                logits.reshape(-1, self.config.vocab_size), 
-                input_ids.reshape(-1), reduction='none'
-            ).reshape(batch_size, seq_len)
-            
-            # Reweighted by 1/t
-            t_weight = 1.0 / max(t_current, 1e-5)
-            resp_lengths = response_mask.sum(dim=1).float().clamp(min=1)
-            
-            step_mdm_loss = (ce_loss * is_masked.float()).sum(dim=1) / resp_lengths
-            step_mdm_loss = (step_mdm_loss * t_weight).mean()
-            total_mdm_loss += step_mdm_loss
-            
-            # --- Halting Loss ---
-            preds = logits.argmax(dim=-1)
-            correct_tokens = (preds == input_ids) | ~response_mask
-            all_correct = correct_tokens.all(dim=1).float() # 1 if decoded sequence is perfect
-            
-            step_q_loss = F.binary_cross_entropy_with_logits(q_logits, all_correct)
-            total_q_loss += step_q_loss
-            
-            # --- Step Metrics ---
-            step_acc = ((preds == input_ids) & response_mask).float().sum() / resp_lengths.sum()
-            metrics[f'step_convergence/mdm_loss_step_{s+1}'] = step_mdm_loss.item()
-            metrics[f'step_convergence/acc_step_{s+1}'] = step_acc.item()
-            
-            # --- Track Ponder Time ---
-            step_halt_condition = torch.sigmoid(q_logits) > getattr(self.config, "halt_threshold", 0.5)
-            new_halts = step_halt_condition & ~halt_found
-            ponder_times[new_halts] = s + 1
-            halt_found |= new_halts
-
-            # Early halting mechanism to save compute
-            if (torch.sigmoid(q_logits) > getattr(self.config, "halt_threshold", 0.9)).all() and s >= 2:
+            # Early Stopping Check
+            if self.halting.should_halt(prob):
                 break
-                
-            # Remask for next denoising iteration
-            if s < n_sup - 1:
-                with torch.no_grad():
-                    # Copy-through constraint: force prompt tokens to remain correct
-                    r_hat = preds.clone()
-                    r_hat[~response_mask] = input_ids[~response_mask]
-                    r_t = self._low_confidence_remask(r_hat, logits, response_mask, t_next)
-            
-            # Detach states to prevent BPTT OOM across denoising steps
-            y, z = y_det, z_det
 
-        # Normalize losses by the number of steps actually taken
-        actual_steps = s + 1
-        avg_mdm_loss = total_mdm_loss / actual_steps
-        avg_q_loss = total_q_loss / actual_steps
+            y = y.detach()
+            z = z.detach()
+
+        avg_lm_loss = accumulated_lm_loss / recursion_depth if labels is not None else 0.0
+        avg_q_loss = accumulated_q_loss / recursion_depth if labels is not None else 0.0
+        avg_total_loss = accumulated_loss / recursion_depth if labels is not None else 0.0
         
-        lambda_halt = getattr(self.config, "lambda_halt", 1.0)
-        total_loss = avg_mdm_loss + (lambda_halt * avg_q_loss)
-        
-        # Global Metrics
-        metrics['loss/total'] = total_loss.item()
-        metrics['loss/mdm_diffusion'] = avg_mdm_loss.item()
-        metrics['loss/q_halting_bce'] = avg_q_loss.item()
-        metrics['metrics/avg_ponder_time'] = ponder_times.mean().item()
-        metrics['metrics/halt_ratio'] = halt_found.float().mean().item()
-        metrics['metrics/final_step_acc'] = metrics[f'step_convergence/acc_step_{actual_steps}']
-            
-        return total_loss / (s + 1), metrics
+        return final_logits, avg_total_loss, avg_lm_loss, avg_q_loss, recursion_depth
         
     @torch.no_grad()
-    def generate(self, prompt_ids: torch.Tensor, max_response_len: int, num_steps: int = 32, position_ids=None):
-        was_training = self.training
-        self.eval()
-        
+    def generate(self, prompt_ids, max_new_tokens=50, max_refinement_steps=10):
+        """
+        prompt_ids: [Batch, PromptSeqLen] - The user's input.
+        """
+
         batch_size = prompt_ids.size(0)
         device = prompt_ids.device
+
+        # Append [MASK] tokens to the end of the prompt to act as placeholders for the answer
+        mask_tokens = torch.full((batch_size, max_new_tokens), self.mask_token_id, device=device, dtype=torch.long)
+        draft_ids = torch.cat([prompt_ids, mask_tokens], dim=1)
         
-        try:
-            # Initialize fully masked sequence
-            masked_response = torch.full((batch_size, max_response_len), self.mask_token_id, device=device)
-            r_t = torch.cat([prompt_ids, masked_response], dim=1)
+        # Initialize continuous states
+        x, y, z = self._initialize_states(draft_ids)
+
+        # Iteratively Refine the Draft
+        for step in range(max_refinement_steps):
             
-            response_mask = torch.zeros_like(r_t, dtype=torch.bool)
-            response_mask[:, prompt_ids.size(1):] = True
+            # Deep reasoning pass
+            z = self.reasoning_module(x, y, z)
+            y = self._update_answer_state(y, z)
             
-            x_emb = self.embed_tokens(r_t)
-            y = x_emb.clone()
-            z = torch.zeros_like(y)
+            logits = self.lm_head(y)
+            prob, _ = self.halting(y)
             
-            for s in range(num_steps):
-                t_next = 1.0 - ((s + 1) / num_steps)
-                x_emb = self.embed_tokens(r_t)
-                
-                # Deep Recursion without Gradients
-                for _ in range(self.config.t_cycles):
-                    y, z = self._latent_recursion(x_emb, y, z, position_ids, mask=None)
-                    
-                logits = self.lm_head(y)
-                r_hat = logits.argmax(dim=-1)
-                
-                copy_mask = (r_t != self.mask_token_id) & response_mask
-                r_hat[copy_mask] = r_t[copy_mask]
-                r_hat[~response_mask] = prompt_ids.view(-1)
-                
-                if s == num_steps - 1:
-                    r_t = r_hat
-                    break
-                    
-                r_t = self._low_confidence_remask(r_hat, logits, response_mask, t_next)
-                
-            return r_t[:, prompt_ids.size(1):]  # Return only the decoded response
-            
-        finally:
-            if was_training:
-                self.train()
+            # If the halting mechanism is confident, we can stop editing early
+            if self.halting.should_halt(prob):
+                break
+
+        # Finalize the Output
+        # Extract the final predicted token IDs
+        final_token_ids = logits.argmax(dim=-1)
+        
+        # We only care about the newly generated part (the masked portion)
+        generated_answers = final_token_ids[:, prompt_ids.size(1):]
+        
+        return generated_answers
         
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count model parameters."""
@@ -371,112 +406,6 @@ class TRLM(nn.Module):
 
         torch.save({
             "config": asdict(self.config),
-            "model_state_dict": self.state_dict()
+            "model_state_dict": self.state_dict(),
+            'ema_state_dict': self.ema.state_dict()
         }, os.path.join(path, "model.pt"))
-
-if __name__ == "__main__":
-    print("🚀 Starting TRLM Sanity Check...")
-    torch.manual_seed(42)
-
-    test_config = TRLMConfig(
-        vocab_size=100,          
-        hidden_dim=64,           
-        num_heads=2,
-        num_groups=2,
-        max_seq_len=32,
-        num_layers=2,
-        swiglu_intermediate_size=128,
-        n_cycles=2,              
-        t_cycles=2,
-        max_act_steps=4          
-    )
-
-    model = TRLM(test_config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    
-    print(f"✅ Model instantiated. Total parameters: {model.num_parameters():,}")
-
-    # Generate Dummy Data
-    batch_size = 2
-    seq_len = 16
-    
-    input_ids = torch.randint(0, test_config.vocab_size, (batch_size, seq_len))
-    target_ids = torch.randint(0, test_config.vocab_size, (batch_size, seq_len))
-    
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-    
-    print(f"📊 Dummy Data created. Input shape: {input_ids.shape}")
-
-    # ==========================================
-    # TEST 1: TRAINING FORWARD PASS
-    # ==========================================
-    print("\n🧪 TEST 1: Forward Pass (Training Mode)")
-    model.train()
-    optimizer.zero_grad()
-    
-    all_logits, all_q_logits = model(
-        input_ids=input_ids, 
-        position_ids=position_ids, 
-        is_causal=False 
-    )
-    
-    expected_logits_shape = (batch_size, test_config.max_act_steps, seq_len, test_config.vocab_size)
-    expected_q_shape = (batch_size, test_config.max_act_steps)
-    
-    assert all_logits.shape == expected_logits_shape, f"Logits shape mismatch: {all_logits.shape} != {expected_logits_shape}"
-    assert all_q_logits.shape == expected_q_shape, f"Q-logits shape mismatch: {all_q_logits.shape} != {expected_q_shape}"
-    print("✅ Forward pass shapes are perfectly aligned.")
-
-    # ==========================================
-    # TEST 2: DEEP SUPERVISION LOSS & BACKWARD PASS
-    # ==========================================
-    print("\n🧪 TEST 2: Deep Supervision Loss & Gradient Flow")
-    
-    total_loss = 0
-    
-    for step in range(test_config.max_act_steps):
-        step_logits = all_logits[:, step, :, :]
-        step_q_logits = all_q_logits[:, step]  
-        
-        # A. Language Modeling Loss (Cross Entropy)
-        ce_loss = F.cross_entropy(
-            step_logits.reshape(-1, test_config.vocab_size), 
-            target_ids.reshape(-1)
-        )
-        
-        # B. Halting Logic Loss (BCE)
-        with torch.no_grad():
-            predictions = step_logits.argmax(dim=-1)
-            is_correct = (predictions == target_ids).all(dim=-1).float() 
-            
-        q_loss = F.binary_cross_entropy_with_logits(step_q_logits, is_correct)
-        
-        total_loss += (ce_loss + q_loss)
-        
-    print(f"ℹ️ Calculated Initial Loss: {total_loss.item():.4f}")
-    
-    total_loss.backward()
-    optimizer.step()
-    
-    assert model.embed_tokens.weight.grad is not None, "❌ No gradient in embed_tokens!"
-    assert model.lm_head.weight.grad is not None, "❌ No gradient in lm_head!"
-    assert model.q_head.mlp[-1].weight.grad is not None, "❌ No gradient in q_head!"
-    
-    print("✅ Backward pass completed successfully. Gradients are flowing!")
-
-    # ==========================================
-    # TEST 3: INFERENCE (GENERATE FUNCTION)
-    # ==========================================
-    print("\n🧪 TEST 3: Inference Generation & Early Stopping")
-    
-    predicted_tokens = model.generate(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        is_causal=False
-    )
-    
-    expected_gen_shape = (batch_size, seq_len)
-    assert predicted_tokens.shape == expected_gen_shape, f"Generate shape mismatch: {predicted_tokens.shape} != {expected_gen_shape}"
-    
-    print(f"✅ Generation successful. Output shape: {predicted_tokens.shape}")
-    print("\n🎉 ALL TESTS PASSED! Model is ready for real training.")
