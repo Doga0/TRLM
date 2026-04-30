@@ -9,7 +9,7 @@ from huggingface_hub import login
 from configs.config import TRLMConfig
 from models.trlm import TRLM
 from training.trainer import TRLMTrainer
-from data.collator import TinyDiffusionRecursiveDataCollator
+from data.collator import MaskingCollator
 from data.dataset import (
     OpenWebTextDataset,
     OpenWebTextConfig,
@@ -82,9 +82,7 @@ mixed_eval_dataset = MixedPretrainDataset(
     probabilities=dataset_probs
 )
 
-collator = TinyDiffusionRecursiveDataCollator(
-        tokenizer=tokenizer,
-    )
+collator = MaskingCollator(tokenizer=tokenizer, mlm_probability=0.15)
 
 train_loader = DataLoader(
     mixed_train_dataset,
@@ -106,10 +104,7 @@ trainer = TRLMTrainer(
     model=model,
     train_dataloader=train_loader,
     eval_dataloader=eval_loader,
-    config=config,
-    epochs=5,
-    warmup_steps=3,
-    gradient_accumulation_steps=16
+    config=config
 )
 
 print("Starting TRDM Pretraining...")
