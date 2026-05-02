@@ -49,20 +49,58 @@ fwe_config = FineWebEduConfig(max_seq_len=config.max_seq_len)
 mp_config = MiniPileConfig(max_seq_len=config.max_seq_len)
 fm_config = FineMathConfig(max_seq_len=config.max_seq_len)
 
-print("Initializing dataset streams...")
-EVAL_SAMPLES_PER_DATASET = 2000
+print("Initializing datasets...")
 
 # TRAIN DATASETS 
-owt_train = OpenWebTextDataset(tokenizer, owt_config, is_eval=False, eval_size=EVAL_SAMPLES_PER_DATASET)
-fwe_train = FineWebEduDataset(tokenizer, fwe_config, is_eval=False, eval_size=EVAL_SAMPLES_PER_DATASET)
-mp_train = MiniPileDataset(tokenizer, mp_config, is_eval=False, eval_size=EVAL_SAMPLES_PER_DATASET)
-fm_train = FineMathDataset(tokenizer, fm_config, is_eval=False, eval_size=EVAL_SAMPLES_PER_DATASET)
+owt_train = OpenWebTextDataset(
+    tokenizer=tokenizer, config=owt_config, 
+    is_eval=False, 
+    eval_size=config.eval_samples_per_step
+)
+fwe_train = FineWebEduDataset(
+    tokenizer=tokenizer, 
+    config=fwe_config, 
+    is_eval=False, 
+    eval_size=config.eval_samples_per_step
+)
+mp_train = MiniPileDataset(
+    tokenizer=tokenizer, 
+    config=mp_config, 
+    is_eval=False, 
+    eval_size=config.eval_samples_per_step
+)
+fm_train = FineMathDataset(
+    tokenizer=tokenizer, 
+    config=fm_config, 
+    is_eval=False, 
+    eval_size=config.eval_samples_per_step
+)
 
 # EVAL DATASETS
-owt_eval = OpenWebTextDataset(tokenizer, owt_config, is_eval=True, eval_size=EVAL_SAMPLES_PER_DATASET)
-fwe_eval = FineWebEduDataset(tokenizer, fwe_config, is_eval=True, eval_size=EVAL_SAMPLES_PER_DATASET)
-mp_eval = MiniPileDataset(tokenizer, mp_config, is_eval=True, eval_size=EVAL_SAMPLES_PER_DATASET)
-fm_eval = FineMathDataset(tokenizer, fm_config, is_eval=True, eval_size=EVAL_SAMPLES_PER_DATASET)
+owt_eval = OpenWebTextDataset(
+    tokenizer=tokenizer, 
+    config=owt_config, 
+    is_eval=True, 
+    eval_size=config.eval_samples_per_step
+)
+fwe_eval = FineWebEduDataset(
+    tokenizer=tokenizer, 
+    config=fwe_config, 
+    is_eval=True, 
+    eval_size=config.eval_samples_per_step
+)
+mp_eval = MiniPileDataset(
+    tokenizer=tokenizer, 
+    config=mp_config, 
+    is_eval=True, 
+    eval_size=config.eval_samples_per_step
+)
+fm_eval = FineMathDataset(
+    tokenizer=tokenizer, 
+    config=fm_config, 
+    is_eval=True, 
+    eval_size=config.eval_samples_per_step
+)
 
 dataset_probs = [
         0.30, # OpenWebText (General knowledge)
@@ -107,5 +145,21 @@ trainer = TRLMTrainer(
     config=config
 )
 
-print("Starting TRDM Pretraining...")
+print("Starting TRLM Pretraining...")
 trainer.train()
+
+if config.push_to_hub:
+    export_dir = os.path.join(config.checkpoint_dir, "hf_export")
+    final_ckpt = os.path.join(config.checkpoint_dir, "checkpoint_final.pt")
+
+    trainer.export_for_hf(
+        export_dir=export_dir, 
+        checkpoint_path=final_ckpt, 
+        tokenizer=tokenizer
+    )
+    trainer.push_to_hf(
+        export_dir=export_dir, 
+        repo_id=config.hf_repo_id
+    )
+
+print("\nFINISHED!!!")
