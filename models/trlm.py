@@ -337,7 +337,7 @@ class TRLM(nn.Module):
         avg_q_loss = accumulated_q_loss / recursion_depth if labels is not None else 0.0
         avg_total_loss = accumulated_loss / recursion_depth if labels is not None else 0.0
         
-        return final_logits, avg_total_loss, avg_lm_loss, avg_q_loss, recursion_depth
+        return final_logits, avg_total_loss, avg_lm_loss, avg_q_loss, recursion_depth, prob
         
     @torch.no_grad()
     def generate(self, prompt_ids, max_new_tokens=50, max_refinement_steps=10):
