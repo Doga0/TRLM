@@ -1,5 +1,5 @@
 import os
-import sys
+import shutil
 from itertools import islice
 from typing import Optional, Dict, Literal, Any, List, Tuple
 from tqdm import tqdm
@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from tqdm.auto import tqdm
-from IPython.display import display, HTML
+from safetensors.torch import save_file
 
 import pandas as pd
 
@@ -16,17 +16,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import get_cosine_schedule_with_warmup
+from huggingface_hub import login
+from huggingface_hub import HfApi
 
 from configs.config import TRLMConfig
 from models.trlm import TRLM
 from training.optimizer import MuonAdamW
+
+from training.configuration_trlm import TRLMConfigHF
 
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_AVAILABLE = True
 except ImportError:
     TENSORBOARD_AVAILABLE = False
-
+    
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("datasets").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Exponential Moving Average
@@ -159,8 +166,11 @@ class TRLMTrainer:
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.epochs = self.config.epochs
-        self.warmup_steps = self.config.warmup_steps
-        self.gradient_accumulation_steps = self.config.gradient_accumulation_steps
+        self.warmup_steps = (
+            self.config.warmup_steps
+            if self.config.warmup_steps is not None
+            else self.config.get_warmup_steps(self.config.max_steps_per_epoch)
+        )
         
         self.device = next(self.model.parameters()).device
 
@@ -170,6 +180,9 @@ class TRLMTrainer:
 
         self.logger = self._setup_logger()
         self.writer = self._setup_tensorboard()
+
+        self.log_model_size()
+        self.log_param_breakdown()
 
         ema_decay = getattr(config, "ema_decay", 0.9999)
         self.ema = EMAModel(self.model, decay=ema_decay, device=self.device)
@@ -182,8 +195,23 @@ class TRLMTrainer:
 
         self.saved_checkpoints: List[str] = []
 
+    def log_model_size(self):
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+
+        self.logger.info(f"Total Parameters: {total_params:,}")
+        self.logger.info(f"Trainable Parameters: {trainable_params:,}")
+        self.logger.info(f"Non-trainable Parameters: {total_params - trainable_params:,}")
+
+    def log_param_breakdown(self):
+        for name, module in self.model.named_children():
+            params = sum(p.numel() for p in module.parameters())
+            self.logger.info(f"{name}: {params:,} params")
+
     def _setup_scheduler(self):
-        total_training_steps = self.config.max_steps_per_epoch * self.epochs
+        total_training_steps = (
+            self.config.max_steps_per_epoch * self.epochs
+        ) // self.config.gradient_accumulation_steps
         
         scheduler = get_cosine_schedule_with_warmup(
             optimizer=self.optimizer,
@@ -271,19 +299,15 @@ class TRLMTrainer:
 
     def _setup_logger(self) -> logging.Logger:
         """Setup Python logger."""
-        logger = logging.getLogger("TRLMTrainer")
+        logger = logging.getLogger()
         logger.setLevel(logging.INFO)
 
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+
         logger.propagate = False
-
-        if logger.handlers:
-            logger.handlers.clear()
-
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-
-        logger.addHandler(handler)
-
         return logger
 
     def _setup_tensorboard(self) -> Optional[Any]:
@@ -314,7 +338,7 @@ class TRLMTrainer:
         labels = batch["labels"]
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            logits, loss, lm_loss, q_loss, recursion_depth = self.model(
+            logits, loss, lm_loss, q_loss, recursion_depth, halt_prob = self.model(
                 masked_input_ids=masked_input_ids,
                 labels=labels
             )
@@ -364,8 +388,10 @@ class TRLMTrainer:
         
         total_loss = 0.0
 
+        total_opt_steps = self.config.max_steps_per_epoch // self.config.gradient_accumulation_steps
+
         pbar = tqdm(
-            total=self.config.max_steps_per_epoch,
+            total=total_opt_steps,
             desc=f"Epoch {self.current_epoch + 1}/{self.epochs}",
             dynamic_ncols=True
         )
@@ -382,29 +408,28 @@ class TRLMTrainer:
 
             avg_loss = total_loss / (step_idx + 1)
 
-            pbar.update(1)
-
             pbar.set_postfix({
                 'step': self.global_step,
                 'loss': f"{avg_loss:.4f}",
-                'lm_loss': f"{step_metrics['lm_loss']:.4e}",
-                'q_loss': f"{step_metrics['q_loss']:.4e}",
+                'lm_loss': f"{step_metrics['lm_loss']:.4f}",
+                'q_loss': f"{step_metrics['q_loss']:.4f}",
                 'ppl': f"{ppl:.4f}",
-                'grad_norm': f"{step_metrics['grad_norm']:.4e}",
-                'lr': f"{self.optimizer.param_groups[0]['lr']:.4e}",
+                'grad_norm': f"{step_metrics['grad_norm']:.4f}",
+                'lr': f"{self.optimizer.param_groups[0]['lr']:.4f}",
                 'depth': f"{step_metrics['recursion_depth']}"
             })
 
             is_opt_step = (step_idx + 1) % self.config.gradient_accumulation_steps == 0
 
             if is_opt_step:
+                pbar.update(1)
                 
                 if self.global_step % getattr(self.config, 'logging_steps', 10) == 0:
                     
                     log_dict = {
                         "Train/Loss": avg_loss,
-                        "Train/Lm_loss": f"{step_metrics['lm_loss']:.4e}",
-                        "Train/Q_loss": f"{step_metrics['q_loss']:.4e}",
+                        "Train/Lm_loss": f"{step_metrics['lm_loss']:.4f}",
+                        "Train/Q_loss": f"{step_metrics['q_loss']:.4f}",
                         "Train/Perplexity": ppl,
                         "Train/LearningRate": self.optimizer.param_groups[0]['lr'],
                         "Metrics/RecursionDepth": step_metrics["recursion_depth"],
@@ -417,30 +442,39 @@ class TRLMTrainer:
 
                     self.logger.info(
                         f"Step {self.global_step} | Loss: {avg_loss:.4f} | "
-                        f"Lm_loss: {step_metrics['lm_loss']:.4e} | "
-                        f"Q_loss: {step_metrics['q_loss']:.4e} | "
+                        f"Lm_loss: {step_metrics['lm_loss']:.4f} | "
+                        f"Q_loss: {step_metrics['q_loss']:.4f} | "
                         f"Ppl: {ppl} | "
                         f"Grad norm: {step_metrics['grad_norm']} | "
                         f"Depth: {step_metrics['recursion_depth']} | "
-                        f"Tokens: {self.tokens_seen:.2e}"
+                        f"Tokens: {self.tokens_seen:.2f}"
                     )
                 
                 # Evaluation
                 if self.global_step % getattr(self.config, 'eval_interval', 10) == 0:
-                    val_loss, epoch_val_ppl = self.evaluate()
+                    avg_val_loss, val_perplexity, avg_acc, avg_depth, avg_halt = self.evaluate()
 
-                    self.logger.info(f"Step {self.global_step} Validation Loss: {val_loss:.4f} | Perplexity: {epoch_val_ppl:.2f}")
+                    self.logger.info(
+                        f"Eval Step {self.global_step} | Loss: {avg_val_loss:.4f} | "
+                        f"PPL: {ppl:.2f} | "
+                        f"Acc: {avg_acc:.4f} | "
+                        f"Depth: {avg_depth:.2f} | "
+                        f"Halt: {avg_halt:.4f}"
+                    )
 
                     self._log_metrics({
-                        "Eval/Loss": val_loss,
-                        "Eval/Perplexity": epoch_val_ppl
+                        "Eval/Loss": avg_val_loss,
+                        "Eval/Perplexity": val_perplexity,
+                        "Eval/Acc": avg_acc,
+                        "Eval/Depth": avg_depth,
+                        "Eval/Halt": avg_halt
                     })
                     
                     self.model.train() 
                     
                     # Check if this is the best model so far
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
+                    if avg_val_loss < self.best_val_loss:
+                        self.best_val_loss = avg_val_loss
                         self.save_checkpoint(is_best=True)
                 
                 # Checkpointing
@@ -477,15 +511,24 @@ class TRLMTrainer:
                 epoch_train_loss = self.train_epoch()
 
                 self.logger.info(f"Epoch {epoch+1} completed. Average Training Loss: {epoch_train_loss:.4f}")
+                
+                self.logger.info("End-of-Epoch Evaluation")
+                epoch_val_loss, epoch_val_ppl, epoch_avg_acc, epoch_avg_depth, epoch_avg_halt = self.evaluate()
 
-                # End-of-Epoch Evaluation
-                epoch_val_loss, epoch_val_ppl = self.evaluate()
-    
-                self.logger.info(f"Epoch {epoch+1} Validation Loss: {epoch_val_loss:.4f} | Perplexity: {epoch_val_ppl:.2f}")
+                self.logger.info(
+                    f"Epoch {epoch+1} | Validation Loss: {epoch_val_loss:.4f} | "
+                    f"PPL: {epoch_val_ppl:.4f} | "
+                    f"Acc: {epoch_avg_acc:.4f} | "
+                    f"Depth: {epoch_avg_depth:.4f} | "
+                    f"Halt: {epoch_avg_halt:.4f}"
+                )
 
                 self._log_metrics({
                     "Eval/Loss": epoch_val_loss,
-                    "Eval/Perplexity": epoch_val_ppl
+                    "Eval/Perplexity": epoch_val_ppl,
+                    "Eval/Acc": epoch_avg_acc,
+                    "Eval/Depth": epoch_avg_depth,
+                    "Eval/Halt": epoch_avg_halt
                 })
 
                 # Update best model state
@@ -520,7 +563,7 @@ class TRLMTrainer:
                 self.writer.close() 
 
         except KeyboardInterrupt:
-            self.logger.warning("\nTraining interrupted by user (KeyboardInterrupt)!")
+            self.logger.warning("\nTraining interrupted by user!")
             self.logger.info("Saving emergency checkpoint before exiting...")
             
             self.save_checkpoint()
@@ -542,6 +585,10 @@ class TRLMTrainer:
             self.ema.apply_shadow()
 
         total_val_loss = 0.0
+        total_val_lm_loss = 0.0
+        total_masked_acc = 0.0
+        total_depth = 0.0
+        total_halt_prob = 0.0
 
         pbar = tqdm(
             self.eval_dataloader,
@@ -552,7 +599,7 @@ class TRLMTrainer:
         )
 
         try:
-            for batch_idx, batch in enumerate(self.eval_dataloader):
+            for batch_idx, batch in enumerate(pbar):
                 if batch_idx >= self.config.eval_steps:
                     break
                 
@@ -565,25 +612,73 @@ class TRLMTrainer:
 
                 # Forward 
                 with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                    logits, loss, lm_loss, q_loss, recursion_depth = self.model(
+                    logits, loss, lm_loss, q_loss, recursion_depth, halt_prob = self.model(
                         masked_input_ids=masked_input_ids,
                         labels=labels
                     )
 
+                # Masked accuracy
+                mask_positions = (labels != -100)
+                if mask_positions.any():
+                    preds = logits.argmax(dim=-1)
+                    acc = (preds[mask_positions] == labels[mask_positions]).float().mean().item()
+                else:
+                    acc = 0.0
+
                 total_val_loss += loss.item()
                 total_val_lm_loss += lm_loss.item()
+                total_masked_acc += acc
+                total_depth += recursion_depth
+                total_halt_prob += halt_prob.mean().item()
                 
             pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
 
-            avg_val_loss = total_val_loss / self.config.eval_steps
-            avg_val_lm_loss = total_val_lm_loss / self.config.eval_steps
+            num_batches = batch_idx + 1
+
+            avg_val_loss = total_val_loss / num_batches
+            avg_lm_loss = total_val_lm_loss / num_batches
+            avg_acc = total_masked_acc / num_batches
+            avg_depth = total_depth / num_batches
+            avg_halt = total_halt_prob / num_batches
             
-            val_perplexity = torch.exp(torch.tensor(avg_val_lm_loss)).item()
+            val_perplexity = torch.exp(torch.tensor(avg_lm_loss)).item()
 
         finally:
             self.ema.restore()
 
-        return avg_val_loss, val_perplexity
+        return avg_val_loss, val_perplexity, avg_acc, avg_depth, avg_halt
+    
+    def export_for_hf(self, export_dir, checkpoint_path, tokenizer):
+
+        os.makedirs(export_dir, exist_ok=True)
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+
+        hf_config = TRLMConfigHF.from_internal(self.config)
+        hf_config.save_pretrained(export_dir)
+
+        save_file(
+            self.model.state_dict(),
+            os.path.join(export_dir, "model.safetensors")
+        )
+
+        tokenizer.save_pretrained(export_dir)
+
+        self.logger.info("HF export completed!")
+
+    def push_to_hf(self, export_dir: str, repo_id: str):
+        self.logger.info(f"Pushing to Hugging Face repo: {repo_id}")
+
+        api = HfApi()
+        api.upload_folder(
+            repo_id=repo_id,
+            folder_path=export_dir,
+            repo_type="model"
+        )
+
+        self.logger.info("Upload complete!")
 
     def save_checkpoint(self, is_best: bool = False, is_final: bool = False):
         
