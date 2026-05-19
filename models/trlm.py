@@ -16,128 +16,33 @@ from models.utils import trunc_normal_init_
 from configs.config import TRLMConfig
 
 
-@dataclass
-class SentenceACTState:
-    halted: torch.Tensor          # (B,)
-    halt_prob_accum: torch.Tensor # (B,)
-    remainders: torch.Tensor      # (B,)
-    n_updates: torch.Tensor       # (B,)
-    output_accum: torch.Tensor    # (B, T, C)
-
-
-class ACTHalting(nn.Module):
-    def __init__(self, hidden_dim: int, halt_threshold: float = 1.0 - 1e-6):
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.halt_head = nn.Linear(hidden_dim, 1)
-        self.halt_threshold = halt_threshold
-
-    def init_state(self, B, T, C, device):
-        return SentenceACTState(
-            halted=torch.zeros(B, dtype=torch.bool, device=device),
-            halt_prob_accum=torch.zeros(B, device=device),
-            remainders=torch.zeros(B, device=device),
-            n_updates=torch.zeros(B, device=device),
-            output_accum=torch.zeros(B, T, C, device=device),
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
         )
+        self.frequency_embedding_size = frequency_embedding_size
 
-    def step(
-        self,
-        x: torch.Tensor,  # (B, T, C)
-        state: SentenceACTState
-    ) -> Tuple[SentenceACTState, bool]:
-
-        # sentence representation
-        h = x[:, 0, :]  # (B, C) TODO: use attention pooling
-
-        halt_logits = self.halt_head(h).squeeze(-1)  # (B,)
-        halt_prob = torch.sigmoid(halt_logits)
-
-        still_running = ~state.halted
-
-        # check halting condition
-        should_halt = (state.halt_prob_accum + halt_prob >= self.halt_threshold)
-
-        new_halted = should_halt & still_running
-
-        # compute remainders
-        remainders = torch.where(
-            new_halted,
-            1.0 - state.halt_prob_accum,
-            state.remainders
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+            device=t.device
         )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
 
-        # compute step weight
-        p = torch.where(
-            new_halted,
-            remainders,
-            torch.where(still_running, halt_prob, torch.zeros_like(halt_prob))
-        )
-
-        # expand to sequence
-        p_expanded = p.view(-1, 1, 1)
-
-        output_accum = state.output_accum + p_expanded * x
-
-        halt_prob_accum = torch.where(
-            still_running & ~new_halted,
-            state.halt_prob_accum + halt_prob,
-            state.halt_prob_accum
-        )
-
-        n_updates = state.n_updates + still_running.float()
-        halted = state.halted | new_halted
-
-        new_state = SentenceACTState(
-            halted=halted,
-            halt_prob_accum=halt_prob_accum,
-            remainders=remainders,
-            n_updates=n_updates,
-            output_accum=output_accum,
-        )
-
-        return (
-            new_state,
-            halted.all().item(),
-            halt_logits.unsqueeze(-1),   # (B, 1)
-            halt_prob.unsqueeze(-1),    # (B, 1)
-            should_halt.unsqueeze(-1)       # (B, 1)
-        )
-
-    def finalize(
-        self,
-        x: torch.Tensor,
-        state: SentenceACTState
-    ):
-        still_running = ~state.halted
-
-        remainders = torch.where(
-            still_running,
-            1.0 - state.halt_prob_accum,
-            state.remainders
-        )
-
-        p_expanded = remainders.view(-1, 1, 1)
-
-        output = state.output_accum + (still_running.float().view(-1,1,1) * p_expanded) * x
-
-        ponder_cost = (state.n_updates + remainders).mean()
-
-        return output, ponder_cost
-    
-class BinaryACTHalting(nn.Module):
-    def __init__(self, hidden_dim, halt_threshold=0.9):
-        super().__init__()
-        self.halt_head = nn.Linear(hidden_dim, 1)
-        self.halt_threshold = halt_threshold
-
-    def forward(self, x):
-        h = x.mean(dim=1)
-        logits = self.halt_head(h).squeeze(-1)
-        prob = torch.sigmoid(logits)
-        return prob, logits
-
-    def should_halt(self, prob):
-        return prob.mean() > self.halt_threshold
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = t_freq.to(dtype=self.mlp[0].weight.dtype)
+        t_emb = self.mlp(t_freq)
+        return t_emb
 
 class ReasoningModule(nn.Module):
     def __init__(self, config: TRLMConfig):
@@ -157,31 +62,43 @@ class ReasoningModule(nn.Module):
                 swiglu_intermediate_size=config.swiglu_intermediate_size,
                 swiglu_hidden_act=config.swiglu_hidden_act,
                 attn_dropout=config.attn_dropout,
-                transformer_dropout=config.transformer_dropout
+                transformer_dropout=config.transformer_dropout,
+                use_adaln=True
             ) for _ in range(config.num_layers)
         ])
 
-        self.num_recursions = getattr(config, 'num_recursions', 3)
+        self.step_dropout = nn.Dropout(config.step_dropout)
 
-        self.gate = nn.Linear(config.hidden_dim, config.hidden_dim)
+        self.max_recursions = getattr(config, 'max_recursions', 8)
+
+        # self.gate = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.norm = nn.LayerNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
-        with torch.no_grad():
-            self.gate.weight.zero_()
-            self.gate.bias.fill_(-2.0) 
+        self.time_embedder = TimestepEmbedder(config.hidden_dim)
+        self.dt_embedder = TimestepEmbedder(config.hidden_dim)
+
+        self.cond_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(config.hidden_dim, 4 * config.hidden_dim, bias=True),
+        )
+        nn.init.zeros_(self.cond_mlp[1].weight)
+        nn.init.zeros_(self.cond_mlp[1].bias)
+
+        # with torch.no_grad():
+        #     self.gate.weight.zero_()
+        #     self.gate.bias.fill_(-2.0) 
 
     def forward(
         self, 
         x: torch.Tensor, 
         y: torch.Tensor, 
-        z: Optional[torch.Tensor] = None,
+        z: torch.Tensor = None,
+        steps: Optional[list[float]] = None,
     ) -> torch.Tensor:
         
         batch_size, seq_len, hidden_dim = x.shape
 
         position_ids = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
-
-        n = self.num_recursions
 
         # Initialize z state to zeros if this is the very first step
         if z is None:
@@ -191,25 +108,39 @@ class ReasoningModule(nn.Module):
         if y.dim() == 2:
             y = y.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # Latent Recursion Loop: refine z 'n' times
-        for _ in range(n):
-            # Combine Input (x), Answer State (y), and Reasoning State (z)
-            combined = torch.cat([x, y, z], dim=-1)     # [Batch, SeqLen, HiddenDim * 3]
-            hidden_state = self.combiner(combined)      # [Batch, SeqLen, HiddenDim]
-            
-            # Pass through the transformer stack
+        if steps is None:
+            steps = [1.0 / self.max_recursions] * self.max_recursions
+
+        # normalized trajectory time
+        ti = torch.zeros(batch_size, device=x.device, dtype=torch.float32)
+
+        # Latent Recursion Loop: refine z 'step' times
+        for dt in steps:
+            dt_base = torch.ones_like(ti) * dt
+            te = self.time_embedder(ti)
+            dte = self.dt_embedder(dt_base)
+            c = te + dte
+
+            # calculate adaln conditioning
+            cond = self.cond_mlp(c)  # [B, 4*H]
+
+            # Combine x, y, z
+            combined = torch.cat([x, y, z], dim=-1)
+            hidden_state = self.combiner(combined)
+
             for layer in self.layers:
-                hidden_state = layer(hidden_state, position_ids=position_ids)
-                
-            # Residual update: add the network's output to the existing z state.
-            # z = z + hidden_state
+                hidden_state = layer(
+                    hidden_state, 
+                    position_ids=position_ids,
+                    cond=cond  
+                )
 
-            # Apply gating to prevents explosion in deep recursion
-            gate = torch.sigmoid(self.gate(hidden_state))   # (B, T, C)
+            hidden_state = self.step_dropout(hidden_state)
 
-            # Residual update
-            z = z + gate * hidden_state
-            
+            # z = z + gate * hidden_state
+            z = z + hidden_state
+            ti = ti + dt
+
         return z
 
 class TRLM(nn.Module):
@@ -222,8 +153,11 @@ class TRLM(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_dim)
 
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight  # Tie
 
-        self.halting = BinaryACTHalting(hidden_dim=config.hidden_dim, halt_threshold=config.halt_threshold)
+        self.short_lm_weight = getattr(config, "short_lm_weight", 0.1)
+        self.consistency_weight = getattr(config, "consistency_weight", 0.1)
+        self.max_recursions = getattr(config, "max_recursions", 8)
 
         self.reasoning_module = ReasoningModule(config)
 
@@ -248,7 +182,7 @@ class TRLM(nn.Module):
         z = torch.zeros_like(x)
         return x, y, z
     
-    def _update_answer_state(self, y, z):
+    def _update_answer_state(self, y, z, cond=None):
         """Updates the answer state 'y' using the reasoning state 'z'."""
         combined = torch.cat([y, z], dim=-1)           # [B, S, H*2]
         h = self.answer_combiner(combined)             # [B, S, H]
@@ -258,15 +192,14 @@ class TRLM(nn.Module):
         
         # Pass through the shared transformer blocks to leverage shared weights
         for layer in self.reasoning_module.layers:
-            h = layer(h, position_ids=position_ids)
-            
+            h = layer(h, position_ids=position_ids, cond=cond)
+        
         return y + h  # Residual connection for stability
     
     def _compute_step_loss(
             self, 
             logits: torch.Tensor, 
             labels: torch.Tensor, 
-            halt_logits: torch.Tensor
         ):
 
         lm_loss = F.cross_entropy(
@@ -274,70 +207,62 @@ class TRLM(nn.Module):
             labels.view(-1),
             ignore_index=-100 
         )
-
-        # Q-Loss (Halting): We only calculate accuracy on the masked positions
-        mask_positions = (labels != -100)
-        if mask_positions.any():
-            correct_predictions = (logits.argmax(-1)[mask_positions] == labels[mask_positions]).float()
-            is_correct = correct_predictions.mean()
-                    
-            q_loss = F.binary_cross_entropy_with_logits(
-                halt_logits, is_correct.expand_as(halt_logits)
-            )
         
-        step_total_loss = lm_loss + (self.config.q_loss_weight * q_loss)
-        
-        return lm_loss, q_loss, step_total_loss
+        return lm_loss
 
-    def forward(self, masked_input_ids, labels=None):
+    def forward(
+            self, 
+            masked_input_ids, 
+            labels=None,
+            long_steps: Optional[list[float]] = None,
+            short_steps: Optional[list[float]] = None
+        ):
         x, y, z = self._initialize_states(masked_input_ids)
 
-        accumulated_loss = 0.0
-        accumulated_lm_loss = 0.0
-        accumulated_q_loss = 0.0
-        final_logits = None
-        recursion_depth = 0
+        if long_steps is None:
+            long_steps = [1.0 / self.max_recursions] * self.max_recursions
 
-        for step in range(self.config.max_supervision_steps):
-            recursion_depth = step + 1
-            
-            # Phase 1: Exploration (T-1 iterations without gradients)
-            with torch.no_grad():
-                for _ in range(self.config.thinking_steps):
-                    z = self.reasoning_module(x, y, z)
-                    y = self._update_answer_state(y, z)
+        z_long = self.reasoning_module(x, y, z, steps=long_steps)
+        y_long = self._update_answer_state(y, z_long)
+        y_long_norm = self.final_norm(y_long)
+        logits_long = self.lm_head(y_long_norm)
 
-            # Phase 2: Supervision (1 final recursion with gradients)
-            z = self.reasoning_module(x, y, z)
-            y = self._update_answer_state(y, z)
+        total_loss = None
+        lm_loss_long = None
+        lm_loss_short = torch.tensor(0.0, device=masked_input_ids.device)
+        consistency_loss = torch.tensor(0.0, device=masked_input_ids.device)
 
-            normalized_y = self.final_norm(y)
+        if labels is not None:
+            lm_loss_long = self._compute_step_loss(logits_long, labels)
+            total_loss = lm_loss_long
 
-            logits = self.lm_head(normalized_y)
-            prob, halt_logits = self.halting(normalized_y)
-            final_logits = logits
+            # Short trajectory + consistency
+            if short_steps is not None:
+                z_short = self.reasoning_module(x, y, z, steps=short_steps)
+                y_short = self._update_answer_state(y, z_short)
+                y_short_norm = self.final_norm(y_short)
+                logits_short = self.lm_head(y_short_norm)
 
-            if labels is not None:
-                step_lm, step_q, step_total = self._compute_step_loss(
-                    logits=logits, labels=labels, halt_logits=halt_logits
+                lm_loss_short = self._compute_step_loss(logits_short, labels)
+
+                # Shortcut-consistency: short path should match long path
+                consistency_loss = F.mse_loss(y_short_norm, y_long_norm.detach())
+
+                total_loss = (
+                    lm_loss_long
+                    + self.short_lm_weight * lm_loss_short
+                    + self.consistency_weight * consistency_loss
                 )
-                
-                accumulated_loss += step_total
-                accumulated_lm_loss += step_lm
-                accumulated_q_loss += step_q
 
-            # Early Stopping Check
-            if self.halting.should_halt(prob):
-                break
-
-            y = y.detach()
-            z = z.detach()
-
-        avg_lm_loss = accumulated_lm_loss / recursion_depth if labels is not None else 0.0
-        avg_q_loss = accumulated_q_loss / recursion_depth if labels is not None else 0.0
-        avg_total_loss = accumulated_loss / recursion_depth if labels is not None else 0.0
-        
-        return final_logits, avg_total_loss, avg_lm_loss, avg_q_loss, recursion_depth, prob
+        return (
+            logits_long,
+            total_loss,
+            lm_loss_long,
+            lm_loss_short,
+            consistency_loss,
+            len(long_steps),
+            y_long_norm,
+        )
         
     @torch.no_grad()
     def generate(self, prompt_ids, max_new_tokens=50, max_refinement_steps=10):
@@ -349,33 +274,29 @@ class TRLM(nn.Module):
         device = prompt_ids.device
 
         # Append [MASK] tokens to the end of the prompt to act as placeholders for the answer
-        mask_tokens = torch.full((batch_size, max_new_tokens), self.mask_token_id, device=device, dtype=torch.long)
+        mask_tokens = torch.full(
+            (batch_size, max_new_tokens), 
+            self.mask_token_id, 
+            device=device, 
+            dtype=torch.long
+        )
         draft_ids = torch.cat([prompt_ids, mask_tokens], dim=1)
         
         # Initialize continuous states
         x, y, z = self._initialize_states(draft_ids)
 
         # Iteratively Refine the Draft
-        for step in range(max_refinement_steps):
-            
-            # Deep reasoning pass
-            z = self.reasoning_module(x, y, z)
-            y = self._update_answer_state(y, z)
-            
-            logits = self.lm_head(y)
-            prob, _ = self.halting(y)
-            
-            # If the halting mechanism is confident, we can stop editing early
-            if self.halting.should_halt(prob):
-                break
+        if max_refinement_steps is None:
+            steps = [1.0 / self.max_recursions] * self.max_recursions
+        else:
+            steps = [1.0 / max_refinement_steps] * max_refinement_steps
 
-        # Finalize the Output
-        # Extract the final predicted token IDs
+        z = self.reasoning_module(x, y, z, steps=steps)
+        y = self._update_answer_state(y, z)
+        logits = self.lm_head(self.final_norm(y))
+
         final_token_ids = logits.argmax(dim=-1)
-        
-        # We only care about the newly generated part (the masked portion)
         generated_answers = final_token_ids[:, prompt_ids.size(1):]
-        
         return generated_answers
         
     def num_parameters(self, trainable_only: bool = True) -> int:
