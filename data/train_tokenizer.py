@@ -53,8 +53,6 @@ class TRLMTokenizerManager:
 
         dataset_configs = [
             ("HuggingFaceFW/fineweb-edu", "sample-10BT", "FineWeb-Edu"),
-            ("JeanKaddour/minipile", None, "MiniPile"),
-            ("HuggingFaceTB/finemath", "finemath-4plus", "FineMath"),
             ("Skylion007/openwebtext", None, "OpenWebText")
         ]
 
@@ -88,7 +86,7 @@ class TRLMTokenizerManager:
         else:
             logger.info(f"✨ Total examples ready for training: {total_yielded}")
 
-    def train(self, samples_per_source: int = 50000):
+    def train(self, samples_per_source: int = 100000):
         """Trains the BPE model on the specified datasets."""
 
         trainer = trainers.BpeTrainer(
