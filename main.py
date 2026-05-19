@@ -26,7 +26,7 @@ dotenv.load_dotenv()
 token = os.environ.get('HF_TOKEN')
 login(token=token)
 
-tokenizer = AutoTokenizer.from_pretrained("DogaOytc/TRLM")
+tokenizer = AutoTokenizer.from_pretrained("DogaOytc/TRLM-tokenizer")
 
 if tokenizer.mask_token is None:
     tokenizer.add_special_tokens({'mask_token': '[MASK]'})
@@ -46,8 +46,6 @@ print(f"Model moved to: {device}")
 
 owt_config = OpenWebTextConfig(max_seq_len=config.max_seq_len)
 fwe_config = FineWebEduConfig(max_seq_len=config.max_seq_len)
-mp_config = MiniPileConfig(max_seq_len=config.max_seq_len)
-fm_config = FineMathConfig(max_seq_len=config.max_seq_len)
 
 print("Initializing datasets...")
 
@@ -63,18 +61,7 @@ fwe_train = FineWebEduDataset(
     is_eval=False, 
     eval_size=config.eval_samples_per_step
 )
-mp_train = MiniPileDataset(
-    tokenizer=tokenizer, 
-    config=mp_config, 
-    is_eval=False, 
-    eval_size=config.eval_samples_per_step
-)
-fm_train = FineMathDataset(
-    tokenizer=tokenizer, 
-    config=fm_config, 
-    is_eval=False, 
-    eval_size=config.eval_samples_per_step
-)
+
 
 # EVAL DATASETS
 owt_eval = OpenWebTextDataset(
@@ -89,34 +76,21 @@ fwe_eval = FineWebEduDataset(
     is_eval=True, 
     eval_size=config.eval_samples_per_step
 )
-mp_eval = MiniPileDataset(
-    tokenizer=tokenizer, 
-    config=mp_config, 
-    is_eval=True, 
-    eval_size=config.eval_samples_per_step
-)
-fm_eval = FineMathDataset(
-    tokenizer=tokenizer, 
-    config=fm_config, 
-    is_eval=True, 
-    eval_size=config.eval_samples_per_step
-)
+
 
 dataset_probs = [
-        0.30, # OpenWebText (General knowledge)
-        0.40, # FineWebEdu (High-quality reasoning)
-        0.15, # MiniPile (Diverse domains)
-        0.15  # FineMath (Algorithmic & logical reasoning)
+        0.50, # OpenWebText (General knowledge)
+        0.50, # FineWebEdu (High-quality reasoning)
     ]
 
 mixed_train_dataset = MixedPretrainDataset(
-    datasets=[owt_train, fwe_train, mp_train, fm_train],
+    datasets=[owt_train, fwe_train],
     probabilities=dataset_probs
 )
 
 # Mix Eval Datasets
 mixed_eval_dataset = MixedPretrainDataset(
-    datasets=[owt_eval, fwe_eval, mp_eval, fm_eval],
+    datasets=[owt_eval, fwe_eval],
     probabilities=dataset_probs
 )
 
