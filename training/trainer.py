@@ -8,15 +8,16 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from tqdm.auto import tqdm
 from safetensors.torch import save_file
+from safetensors.torch import save_model
 
-import pandas as pd
+import numpy as np
+import random
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import get_cosine_schedule_with_warmup
-from huggingface_hub import login
 from huggingface_hub import HfApi
 
 from configs.config import TRLMConfig
@@ -233,6 +234,8 @@ class TRLMTrainer:
         
         weight_decay = getattr(self.config, "weight_decay", 0.01)
 
+        muon_params_by_shape = {}
+
         muon_params = []
         adamw_decay_params = []
         adamw_no_decay_params = []
@@ -249,7 +252,10 @@ class TRLMTrainer:
             
             # Muon for 2D hidden weights inside the core network
             elif param.ndim == 2 and "reasoning_module" in name:
-                muon_params.append(param)
+                shape = tuple(param.shape)
+                if shape not in muon_params_by_shape:
+                    muon_params_by_shape[shape] = []
+                muon_params_by_shape[shape].append(param)
                 
             # AdamW with weight decay for everything else (Embeddings, lm_head, q_head)
             else:
@@ -299,15 +305,42 @@ class TRLMTrainer:
 
     def _setup_logger(self) -> logging.Logger:
         """Setup Python logger."""
+
+        TRAIN_LEVEL_NUM = 21
+        EVAL_LEVEL_NUM = 22
+
+        logging.addLevelName(TRAIN_LEVEL_NUM, "TRAIN")
+        logging.addLevelName(EVAL_LEVEL_NUM, "EVAL")
+
+        if not hasattr(logging.Logger, "train"):
+            def log_train(self, message, *args, **kws):
+                if self.isEnabledFor(TRAIN_LEVEL_NUM):
+                    self._log(TRAIN_LEVEL_NUM, message, args, **kws)
+            logging.Logger.train = log_train
+
+        if not hasattr(logging.Logger, "eval"):
+            def log_eval(self, message, *args, **kws):
+                if self.isEnabledFor(EVAL_LEVEL_NUM):
+                    self._log(EVAL_LEVEL_NUM, message, args, **kws)
+            logging.Logger.eval = log_eval
+
         logger = logging.getLogger()
         logger.setLevel(logging.INFO)
 
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(message)s"))
-            logger.addHandler(handler)
+        if logger.handlers:
+            logger.handlers.clear()
+
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)-5s | %(message)s",
+            datefmt="%H:%M:%S"
+        )
+
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
         logger.propagate = False
+
         return logger
 
     def _setup_tensorboard(self) -> Optional[Any]:
@@ -319,13 +352,47 @@ class TRLMTrainer:
 
         return SummaryWriter(log_dir=self.config.log_dir, flush_secs=5)
 
-    def _log_metrics(self, metrics: Dict[str, float]):
+    def _log_metrics(self, metrics: Dict[str, float], step: int):
         """Log metrics to all configured destinations."""
 
         # TensorBoard
         if self.writer is not None:
             for key, value in metrics.items():
-                self.writer.add_scalar(key, value, self.global_step)
+                self.writer.add_scalar(key, value, step)
+
+    def sample_short_trajectory(self, max_loops):
+        """
+        Return a random discrete trajectory from 0 to 1, as an array of step sizes
+        drawn from {x / max_loops | x=1..max_loops-1}, with total sum == 1.
+
+        The number of steps (trajectory length) L is chosen uniformly from 1 to max_loops-1.
+        """
+        assert max_loops >= 2, "max_loops must be >= 2"
+
+        allowed = [x / max_loops for x in range(1, max_loops+1)]  # possible step sizes
+        min_step = allowed[0]
+
+        # choose path length L uniformly
+        L = random.randint(1, max_loops - 1)
+
+        trajectory = []
+        remaining = 1.0
+        remaining_steps = L
+
+        for _ in range(L - 1):
+            # max we can take now so that (remaining_steps - 1) * min_step can still fit
+            cap = remaining - (remaining_steps - 1) * min_step
+            # pick any allowed step <= cap
+            choices = [s for s in allowed if s <= cap + 1e-12]
+            v = random.choice(choices)
+            trajectory.append(v)
+            remaining -= v
+            remaining_steps -= 1
+
+        # last step must exactly fill to 1
+        trajectory.append(remaining)
+
+        return np.array(trajectory)
 
     def train_step(self, batch: Dict[str, torch.Tensor], step_idx: int):
         """
@@ -338,9 +405,14 @@ class TRLMTrainer:
         labels = batch["labels"]
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            logits, loss, lm_loss, q_loss, recursion_depth, halt_prob = self.model(
+            long_trajectory = [1.0 / self.config.max_recursions] * self.config.max_recursions
+            short_trajectory = self.sample_short_trajectory(self.config.max_recursions)
+            
+            logits, loss, lm_loss_long, lm_loss_short, consistency_loss, depth, _  = self.model(
                 masked_input_ids=masked_input_ids,
-                labels=labels
+                labels=labels,
+                long_steps=long_trajectory,
+                short_steps=short_trajectory,
             )
 
             scaled_loss = loss / self.config.gradient_accumulation_steps
@@ -365,17 +437,18 @@ class TRLMTrainer:
 
             self.global_step += 1
 
-        safe_lm_loss = torch.clamp(lm_loss, max=20.0) 
+        safe_lm_loss = torch.clamp(lm_loss_long, max=20.0)
         perplexity = torch.exp(safe_lm_loss).item()
 
         return {
             "loss": loss.item(),
-            "lm_loss": lm_loss.item(),
-            "q_loss": q_loss.item(),
+            "lm_loss": lm_loss_long.item(),
+            "short_lm_loss": lm_loss_short.item() if torch.is_tensor(lm_loss_short) else 0.0,
+            "consistency_loss": consistency_loss.item() if torch.is_tensor(consistency_loss) else 0.0,
             "perplexity": perplexity,
-            "recursion_depth": recursion_depth,
+            "recursion_depth": depth,
             "grad_norm": grad_norm,
-            "batch_tokens": masked_input_ids.numel() # Total tokens processed
+            "batch_tokens": masked_input_ids.numel()
         }
 
     def train_epoch(self):
@@ -411,9 +484,9 @@ class TRLMTrainer:
             pbar.set_postfix({
                 'step': self.global_step,
                 'loss': f"{avg_loss:.4f}",
-                'lm_loss': f"{step_metrics['lm_loss']:.4f}",
-                'q_loss': f"{step_metrics['q_loss']:.4f}",
-                'ppl': f"{ppl:.4f}",
+                'short_lm_loss': f"{step_metrics['short_lm_loss']:.4f}",
+                'consistency_loss': f"{step_metrics['consistency_loss']:.4f}",
+                'masked_ppl': f"{ppl:.4f}",
                 'grad_norm': f"{step_metrics['grad_norm']:.4f}",
                 'lr': f"{self.optimizer.param_groups[0]['lr']:.4f}",
                 'depth': f"{step_metrics['recursion_depth']}"
@@ -428,22 +501,21 @@ class TRLMTrainer:
                     
                     log_dict = {
                         "Train/Loss": avg_loss,
-                        "Train/Lm_loss": f"{step_metrics['lm_loss']:.4f}",
-                        "Train/Q_loss": f"{step_metrics['q_loss']:.4f}",
-                        "Train/Perplexity": ppl,
+                        "Train/LmLoss": step_metrics['lm_loss'],
+                        "Train/ShortLmLoss": step_metrics['short_lm_loss'],
+                        "Train/ConsistencyLoss": step_metrics['consistency_loss'],
+                        "Train/MaskedPerplexity": ppl,
                         "Train/LearningRate": self.optimizer.param_groups[0]['lr'],
                         "Metrics/RecursionDepth": step_metrics["recursion_depth"],
-                        "Metrics/TokensSeen": self.tokens_seen
+                        "Metrics/TokensSeen": self.tokens_seen,
+                        "Metrics/GradNorm": step_metrics["grad_norm"],
                     }
 
-                    log_dict["Metrics/GradNorm"] = step_metrics["grad_norm"]
+                    self._log_metrics(log_dict, step=self.global_step)
 
-                    self._log_metrics(log_dict)
-
-                    self.logger.info(
+                    self.logger.train(
                         f"Step {self.global_step} | Loss: {avg_loss:.4f} | "
                         f"Lm_loss: {step_metrics['lm_loss']:.4f} | "
-                        f"Q_loss: {step_metrics['q_loss']:.4f} | "
                         f"Ppl: {ppl} | "
                         f"Grad norm: {step_metrics['grad_norm']} | "
                         f"Depth: {step_metrics['recursion_depth']} | "
@@ -452,23 +524,28 @@ class TRLMTrainer:
                 
                 # Evaluation
                 if self.global_step % getattr(self.config, 'eval_interval', 10) == 0:
-                    avg_val_loss, val_perplexity, avg_acc, avg_depth, avg_halt = self.evaluate()
+                    avg_val_loss, val_perplexity, acc_long, acc_short, acc_diff, consistency, avg_depth = self.evaluate()
 
-                    self.logger.info(
-                        f"Eval Step {self.global_step} | Loss: {avg_val_loss:.4f} | "
-                        f"PPL: {ppl:.2f} | "
-                        f"Acc: {avg_acc:.4f} | "
-                        f"Depth: {avg_depth:.2f} | "
-                        f"Halt: {avg_halt:.4f}"
+                    self.logger.eval(
+                        f"Eval Step {self.global_step} | "
+                        f"Loss: {avg_val_loss:.4f} | "
+                        f"Masked PPL: {val_perplexity:.2f} | "
+                        f"Acc_Long: {acc_long:.4f} | "
+                        f"Acc_Short: {acc_short:.4f} | "
+                        f"Acc_Diff: {acc_diff:.4f}"
+                        f"Consistency: {consistency:.4f}"
+                        f"Depth: {avg_depth:.2f}"
                     )
 
                     self._log_metrics({
                         "Eval/Loss": avg_val_loss,
-                        "Eval/Perplexity": val_perplexity,
-                        "Eval/Acc": avg_acc,
+                        "Eval/Masked_Perplexity": val_perplexity,
+                        "Eval/Acc_Long": acc_long,
+                        "Eval/Acc_Short": acc_short,
+                        "Eval/Acc_Diff": acc_diff,
+                        "Eval/Consistency": consistency,
                         "Eval/Depth": avg_depth,
-                        "Eval/Halt": avg_halt
-                    })
+                    }, step=self.global_step)
                     
                     self.model.train() 
                     
@@ -512,30 +589,32 @@ class TRLMTrainer:
 
                 self.logger.info(f"Epoch {epoch+1} completed. Average Training Loss: {epoch_train_loss:.4f}")
                 
-                self.logger.info("End-of-Epoch Evaluation")
-                epoch_val_loss, epoch_val_ppl, epoch_avg_acc, epoch_avg_depth, epoch_avg_halt = self.evaluate()
-
-                self.logger.info(
+                self.logger.eval("End-of-Epoch Evaluation")
+                epoch_val_loss, epoch_val_ppl, epoch_avg_acc_long, epoch_avg_acc_short, epoch_acc_diff, epoch_consistency, epoch_avg_depth = self.evaluate()
+                
+                self.logger.eval(
                     f"Epoch {epoch+1} | Validation Loss: {epoch_val_loss:.4f} | "
-                    f"PPL: {epoch_val_ppl:.4f} | "
-                    f"Acc: {epoch_avg_acc:.4f} | "
-                    f"Depth: {epoch_avg_depth:.4f} | "
-                    f"Halt: {epoch_avg_halt:.4f}"
+                    f"Masked PPL: {epoch_val_ppl:.4f} | "
+                    f"Acc Long: {epoch_avg_acc_long:.4f} | "
+                    f"Acc Short: {epoch_avg_acc_short:.4f} | "
+                    f"Depth: {epoch_avg_depth:.4f}"
                 )
 
                 self._log_metrics({
                     "Eval/Loss": epoch_val_loss,
-                    "Eval/Perplexity": epoch_val_ppl,
-                    "Eval/Acc": epoch_avg_acc,
+                    "Eval/Masked_Perplexity": epoch_val_ppl,
+                    "Eval/Acc_Long": epoch_avg_acc_long,
+                    "Eval/Acc_Short": epoch_avg_acc_short,
+                    "Eval/Acc_Diff": epoch_acc_diff,
+                    "Eval/Consistency": epoch_consistency,
                     "Eval/Depth": epoch_avg_depth,
-                    "Eval/Halt": epoch_avg_halt
-                })
+                }, step=self.global_step)
 
                 # Update best model state
                 if epoch_val_loss < self.best_val_loss:
                     self.best_val_loss = epoch_val_loss
                     self.save_checkpoint(is_best=True)
-                    self.logger.info(f"New best validation loss: {self.best_val_loss:.4f}. Saved best model.")
+                    self.logger.eval(f"New best validation loss: {self.best_val_loss:.4f}. Saved best model.")
 
                 self.save_checkpoint()
 
@@ -588,7 +667,13 @@ class TRLMTrainer:
         total_val_lm_loss = 0.0
         total_masked_acc = 0.0
         total_depth = 0.0
-        total_halt_prob = 0.0
+
+        total_val_loss = 0.0
+        total_lm_loss_long = 0.0
+        total_acc_long = 0.0
+        total_acc_short = 0.0
+        total_consistency = 0.0
+        total_depth = 0.0
 
         pbar = tqdm(
             self.eval_dataloader,
@@ -598,6 +683,12 @@ class TRLMTrainer:
             leave=False
         )
 
+        max_recursions = self.config.max_recursions
+        long_steps = [1.0 / max_recursions] * max_recursions
+
+        short_len = random.randint(1, max_recursions - 1) if max_recursions > 1 else 1
+        short_steps = [1.0 / short_len] * short_len
+
         try:
             for batch_idx, batch in enumerate(pbar):
                 if batch_idx >= self.config.eval_steps:
@@ -605,48 +696,73 @@ class TRLMTrainer:
                 
                 batch = self._move_to_device(batch)
 
-                pbar.update(1)
-
                 masked_input_ids = batch["masked_input_ids"]
                 labels = batch["labels"]
 
                 # Forward 
                 with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-                    logits, loss, lm_loss, q_loss, recursion_depth, halt_prob = self.model(
+                    logits_long, loss_long, lm_loss_long, _, _, depth_long, y_long = self.model(
                         masked_input_ids=masked_input_ids,
-                        labels=labels
+                        labels=labels,
+                        long_steps=[1.0 / self.config.max_recursions] * self.config.max_recursions,
+                        short_steps=None
+                    )
+
+                    logits_short, loss_short, lm_loss_short, _, _, depth_short, y_short = self.model(
+                        masked_input_ids=masked_input_ids,
+                        labels=labels,
+                        long_steps=short_steps,  
+                        short_steps=None
                     )
 
                 # Masked accuracy
-                mask_positions = (labels != -100)
-                if mask_positions.any():
-                    preds = logits.argmax(dim=-1)
-                    acc = (preds[mask_positions] == labels[mask_positions]).float().mean().item()
+                mask = (labels != -100)
+                if mask.any():
+                    acc_long = (logits_long.argmax(dim=-1)[mask] == labels[mask]).float().mean().item()
+                    acc_short = (logits_short.argmax(dim=-1)[mask] == labels[mask]).float().mean().item()
                 else:
-                    acc = 0.0
+                    acc_long = 0.0
+                    acc_short = 0.0
 
-                total_val_loss += loss.item()
-                total_val_lm_loss += lm_loss.item()
-                total_masked_acc += acc
-                total_depth += recursion_depth
-                total_halt_prob += halt_prob.mean().item()
-                
-            pbar.set_postfix({'val_loss': f"{loss.item():.4f}"})
+                # Consistency MSE
+                consistency = F.mse_loss(y_long, y_short).item()
 
-            num_batches = batch_idx + 1
+                total_val_loss += loss_long.item()
+                total_lm_loss_long += lm_loss_long.item()
+                total_acc_long += acc_long
+                total_acc_short += acc_short
+                total_consistency += consistency
+                total_depth += depth_long
+
+                pbar.set_postfix({
+                    'valloss': f"{loss_long.item():.4f}",
+                    'accL': f"{acc_long:.3f}",
+                    'accS': f"{acc_short:.3f}",
+                })
+
+            num_batches = batch_idx + 1 
 
             avg_val_loss = total_val_loss / num_batches
-            avg_lm_loss = total_val_lm_loss / num_batches
-            avg_acc = total_masked_acc / num_batches
+            avg_lm_loss = total_lm_loss_long / num_batches
+            avg_acc_long = total_acc_long / num_batches
+            avg_acc_short = total_acc_short / num_batches
+            avg_acc_diff = avg_acc_long - avg_acc_short
+            avg_consistency = total_consistency / num_batches
             avg_depth = total_depth / num_batches
-            avg_halt = total_halt_prob / num_batches
-            
             val_perplexity = torch.exp(torch.tensor(avg_lm_loss)).item()
 
         finally:
             self.ema.restore()
 
-        return avg_val_loss, val_perplexity, avg_acc, avg_depth, avg_halt
+        return (
+            avg_val_loss, 
+            val_perplexity,
+            avg_acc_long, 
+            avg_acc_short, 
+            avg_acc_diff,
+            avg_consistency, 
+            avg_depth
+        )
     
     def export_for_hf(self, export_dir, checkpoint_path, tokenizer):
 
@@ -659,8 +775,8 @@ class TRLMTrainer:
         hf_config = TRLMConfigHF.from_internal(self.config)
         hf_config.save_pretrained(export_dir)
 
-        save_file(
-            self.model.state_dict(),
+        save_model(
+            self.model,
             os.path.join(export_dir, "model.safetensors")
         )
 
