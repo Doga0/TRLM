@@ -177,9 +177,12 @@ class TransformerBlock(nn.Module):
                  swiglu_intermediate_size,
                  swiglu_hidden_act,
                  attn_dropout,
-                 transformer_dropout
+                 transformer_dropout,
+                 use_adaln: bool = False
             ):
         super().__init__()
+
+        self.use_adaln = use_adaln
 
         self.norm1 = RMSNorm( 
             hidden_dim=hidden_dim, 
@@ -222,24 +225,43 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         position_ids: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        is_causal: bool = False
+        is_causal: bool = False,
+        cond: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         
-        residual = x
+        if cond is not None and self.use_adaln:
+            gate_msa, gate_mlp, scale_msa, scale_mlp = cond.chunk(4, dim=-1)
+            gate_msa = gate_msa.unsqueeze(1)   # [B, 1, H]
+            gate_mlp = gate_mlp.unsqueeze(1)
+            scale_msa = scale_msa.unsqueeze(1)
+            scale_mlp = scale_mlp.unsqueeze(1)
+        else:
+            # Normal residual (adaLN yoksa)
+            gate_msa = gate_mlp = 1.0
+            scale_msa = scale_mlp = 0.0
         
         # Pre-Norm
+        residual = x
         x = self.norm1(x)
+        if self.use_adaln:
+            x = x * (1 + scale_msa)  
         x = self.attn(
             x=x, 
             position_ids=position_ids, 
             mask=mask, 
             is_causal=is_causal
         )
+        if self.use_adaln:
+            x = gate_msa * x         
         x = residual + self.dropout(x)
         
         residual = x
         x = self.norm2(x)
+        if self.use_adaln:
+            x = x * (1 + scale_mlp)  
         x = self.mlp(x)
+        if self.use_adaln:
+            x = gate_mlp * x         
         x = residual + self.dropout(x)
         
         return x
