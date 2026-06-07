@@ -3,19 +3,19 @@ from dataclasses import dataclass
 @dataclass
 class TRLMConfig:
     # model params
-    vocab_size: int = 50257
+    # vocab_size: int = 50257
     hidden_dim: int = 512
     num_heads: int = 8
     num_groups: int = 2
     max_seq_len: int = 1024
-    num_layers: int = 4
+    num_layers: int = 12
     rms_norm_eps: float = 1e-6
     attn: str = "gqa"
     attn_dropout: float = 0.0
     transformer_dropout: float = 0.0
     step_dropout: float = 0.1
 
-    mask_token_id: int = -1
+    mask_token_id: int = 2
 
     # MLP (SwiGLU)
     swiglu_intermediate_size: int = 2048
@@ -23,14 +23,15 @@ class TRLMConfig:
 
     # TRM recursion params
     thinking_steps: int = 4
-    max_recursions: int = 8
+    max_recursions: int = 16
+    min_recursions: int = 1
 
     # logging and saving
     use_tensorboard: bool = True
     save_total_limit: int = 5
-    log_dir: str = "/content/drive/MyDrive/TRM/TRLM/exp2/logs"
+    log_dir: str = "/content/drive/MyDrive/TRM/TRLM/exp4/logs"
     logging_steps: int = 1
-    checkpoint_dir: str = "/content/drive/MyDrive/TRM/TRLM/exp2/checkpoints"
+    checkpoint_dir: str = "/content/drive/MyDrive/TRM/TRLM/exp4/checkpoints"
     push_to_hub: bool = True
     hf_repo_id: str = "DogaOytc/TRLM"
 
@@ -61,8 +62,26 @@ class TRLMConfig:
     warmup_ratio: float = 0.1
     epochs: int = 1
 
+    refinement_probability: float = 0.5
+    refinement_loss_weight: float = 0.5
+    eval_refinement_remask_ratio: float = 0.3
+
     # ema
     ema_decay: float = 0.999
+
+    # token-budget training
+    max_train_tokens: int = 1_000_000_000
+    warmup_ratio: float = 0.03
+
+    log_token_interval: int = 100_000
+    eval_token_interval: int = 10_000_000
+    save_token_interval: int = 250_000_000
+
+    # masking
+    mlm_probability: float = 0.20
+    mask_random_prob: float = 0.50
+    mask_span_prob: float = 0.30
+    mask_continuation_prob: float = 0.20
 
     def get_warmup_steps(self, actual_steps_per_epoch: int = None):
         steps_per_epoch = actual_steps_per_epoch or self.max_steps_per_epoch
