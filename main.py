@@ -2,6 +2,7 @@ import dotenv
 import os
 import torch
 from torch.utils.data import DataLoader
+from torchdata.stateful_dataloader import StatefulDataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from huggingface_hub import login
@@ -13,12 +14,8 @@ from data.collator import MaskingCollator
 from data.dataset import (
     OpenWebTextDataset,
     OpenWebTextConfig,
-    FineMathDataset,
-    FineMathConfig,
     FineWebEduDataset,
     FineWebEduConfig,
-    MiniPileDataset,
-    MiniPileConfig,
     MixedPretrainDataset
 )
 
@@ -94,9 +91,17 @@ mixed_eval_dataset = MixedPretrainDataset(
     probabilities=dataset_probs
 )
 
-collator = MaskingCollator(tokenizer=tokenizer, mlm_probability=0.15)
+collator = MaskingCollator(
+    tokenizer=tokenizer,
+    mlm_probability=config.mlm_probability,
+    random_prob=config.mask_random_prob,
+    span_prob=config.mask_span_prob,
+    continuation_prob=config.mask_continuation_prob,
+    mean_span_length=4,
+    max_span_length=12,
+)
 
-train_loader = DataLoader(
+train_loader = StatefulDataLoader(
     mixed_train_dataset,
     batch_size=16,
     collate_fn=collator,
@@ -104,7 +109,7 @@ train_loader = DataLoader(
     pin_memory=True
 )
 
-eval_loader = DataLoader(
+eval_loader = StatefulDataLoader(
     mixed_eval_dataset,
     batch_size=16,
     collate_fn=collator,
