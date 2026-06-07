@@ -81,12 +81,16 @@ class ReasoningModule(nn.Module):
             nn.SiLU(),
             nn.Linear(config.hidden_dim, 4 * config.hidden_dim, bias=True),
         )
-        nn.init.zeros_(self.cond_mlp[1].weight)
-        nn.init.zeros_(self.cond_mlp[1].bias)
 
         # with torch.no_grad():
         #     self.gate.weight.zero_()
         #     self.gate.bias.fill_(-2.0) 
+
+    def init_adaln(self, hidden_dim):
+        with torch.no_grad():
+            self.cond_mlp[1].weight.zero_()
+            self.cond_mlp[1].bias.zero_()
+            self.cond_mlp[1].bias[: 2 * hidden_dim].fill_(0.1)
 
     def forward(
         self, 
@@ -166,6 +170,8 @@ class TRLM(nn.Module):
         self.final_norm = nn.LayerNorm(config.hidden_dim, eps=config.rms_norm_eps)
 
         self.apply(self._init_weights)
+
+        self.reasoning_module.init_adaln(config.hidden_dim)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -265,39 +271,161 @@ class TRLM(nn.Module):
         )
         
     @torch.no_grad()
-    def generate(self, prompt_ids, max_new_tokens=50, max_refinement_steps=10):
+    def _filter_generation_logits(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        forbid_token_ids: list[int] | None = None,
+    ):
         """
-        prompt_ids: [Batch, PromptSeqLen] - The user's input.
+        logits: [B, S, V]
+        Returns filtered logits.
+        """
+        logits = logits.float()
+
+        if forbid_token_ids is not None:
+            vocab_size = logits.size(-1)
+            for token_id in forbid_token_ids:
+                if token_id is not None and 0 <= int(token_id) < vocab_size:
+                    logits[..., int(token_id)] = -float("inf")
+
+        if temperature is not None and temperature > 0:
+            logits = logits / temperature
+
+        if top_k is not None and top_k > 0 and top_k < logits.size(-1):
+            values, indices = torch.topk(logits, k=top_k, dim=-1)
+            filtered = torch.full_like(logits, -float("inf"))
+            filtered.scatter_(-1, indices, values)
+            logits = filtered
+
+        return logits
+
+
+    @torch.no_grad()
+    def generate(
+        self,
+        masked_input_ids: torch.Tensor,
+        num_iterations: int = 8,
+        recursion_steps: int | None = None,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        do_sample: bool = False,
+        remask_ratio_start: float = 0.7,
+        remask_ratio_end: float = 0.0,
+        forbid_mask_token: bool = True,
+        forbid_token_ids: list[int] | None = None,
+        return_confidence: bool = False,
+    ):
         """
 
-        batch_size = prompt_ids.size(0)
-        device = prompt_ids.device
+        This function fills only the positions that are already equal to mask_token_id.
+        All non-mask tokens are preserved exactly.
 
-        # Append [MASK] tokens to the end of the prompt to act as placeholders for the answer
-        mask_tokens = torch.full(
-            (batch_size, max_new_tokens), 
-            self.mask_token_id, 
-            device=device, 
-            dtype=torch.long
-        )
-        draft_ids = torch.cat([prompt_ids, mask_tokens], dim=1)
-        
-        # Initialize continuous states
-        x, y, z = self._initialize_states(draft_ids)
+        Best use:
+            input:  "The capital of France is <|mask|>."
+            output: "The capital of France is Paris."
+        """
+        self.eval()
 
-        # Iteratively Refine the Draft
-        if max_refinement_steps is None:
-            steps = [1.0 / self.max_recursions] * self.max_recursions
-        else:
-            steps = [1.0 / max_refinement_steps] * max_refinement_steps
+        device = masked_input_ids.device
+        current_ids = masked_input_ids.clone()
 
-        z = self.reasoning_module(x, y, z, steps=steps)
-        y = self._update_answer_state(y, z)
-        logits = self.lm_head(self.final_norm(y))
+        original_mask = current_ids.eq(self.mask_token_id)
 
-        final_token_ids = logits.argmax(dim=-1)
-        generated_answers = final_token_ids[:, prompt_ids.size(1):]
-        return generated_answers
+        if not original_mask.any():
+            if return_confidence:
+                return current_ids, torch.ones_like(current_ids, dtype=torch.float32)
+            return current_ids
+
+        if recursion_steps is None:
+            recursion_steps = self.max_recursions
+
+        recursion_steps = max(1, int(recursion_steps))
+        inner_steps = [1.0 / recursion_steps] * recursion_steps
+
+        if forbid_token_ids is None:
+            forbid_token_ids = []
+
+        if forbid_mask_token:
+            forbid_token_ids = list(forbid_token_ids) + [self.mask_token_id]
+
+        last_confidence = torch.zeros_like(current_ids, dtype=torch.float32)
+
+        for iteration in range(num_iterations):
+            logits, *_ = self.forward(
+                masked_input_ids=current_ids,
+                labels=None,
+                long_steps=inner_steps,
+                short_steps=None,
+            )
+
+            logits = self._filter_generation_logits(
+                logits=logits,
+                temperature=temperature,
+                top_k=top_k,
+                forbid_token_ids=forbid_token_ids,
+            )
+
+            probs = torch.softmax(logits, dim=-1)
+
+            if do_sample:
+                flat_probs = probs.reshape(-1, probs.size(-1))
+                sampled_ids = torch.multinomial(flat_probs, num_samples=1)
+                predicted_ids = sampled_ids.view(current_ids.shape)
+
+                confidence = probs.gather(
+                    dim=-1,
+                    index=predicted_ids.unsqueeze(-1),
+                ).squeeze(-1)
+            else:
+                confidence, predicted_ids = probs.max(dim=-1)
+
+            # Sadece orijinal mask pozisyonlarını doldur.
+            current_ids[original_mask] = predicted_ids[original_mask]
+            last_confidence[original_mask] = confidence[original_mask]
+
+            if iteration == num_iterations - 1:
+                break
+
+            progress = (iteration + 1) / max(1, num_iterations - 1)
+            remask_ratio = remask_ratio_start + progress * (
+                remask_ratio_end - remask_ratio_start
+            )
+            remask_ratio = max(0.0, min(1.0, float(remask_ratio)))
+
+            remask = torch.zeros_like(original_mask)
+
+            # Her batch elemanı için düşük güvenli mask pozisyonlarını tekrar maskele.
+            for b in range(current_ids.size(0)):
+                mask_positions = torch.nonzero(original_mask[b], as_tuple=False).squeeze(-1)
+
+                if mask_positions.numel() == 0:
+                    continue
+
+                num_to_remask = int(round(mask_positions.numel() * remask_ratio))
+
+                if num_to_remask <= 0:
+                    continue
+
+                num_to_remask = min(num_to_remask, mask_positions.numel())
+
+                conf_b = last_confidence[b, mask_positions]
+                low_conf_local = torch.topk(
+                    conf_b,
+                    k=num_to_remask,
+                    largest=False,
+                ).indices
+
+                low_conf_positions = mask_positions[low_conf_local]
+                remask[b, low_conf_positions] = True
+
+            current_ids[remask] = self.mask_token_id
+
+        if return_confidence:
+            return current_ids, last_confidence
+
+        return current_ids
         
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count model parameters."""
