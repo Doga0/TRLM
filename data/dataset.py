@@ -14,7 +14,7 @@ class BaseDatasetConfig(BaseModel):
     shuffle_buffer_size: int = 10000
 
 class OpenWebTextConfig(BaseDatasetConfig):
-    dataset_path: str = "openwebtext"
+    dataset_path: str = "dvruette/openwebtext"
     
 class FineWebEduConfig(BaseDatasetConfig):
     dataset_path: str = "HuggingFaceFW/fineweb-edu"
