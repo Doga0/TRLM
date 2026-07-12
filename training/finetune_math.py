@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fine-tune TRLM or GPT-2 on GSM8K + SVAMP and evaluate on their test splits.
+Fine-tune TRLM, GPT-2, or Gemma4-Text on GSM8K + SVAMP and evaluate on their test splits.
 
 TRLM mode:
     Prompt tokens stay visible.
@@ -9,13 +9,13 @@ TRLM mode:
     Loss is computed only on answer tokens.
     Evaluation uses TRLM mask-filling generation.
 
-GPT-2 mode:
+GPT-2 / Gemma4-Text mode:
     Prompt + answer tokens are fed autoregressively.
     Prompt labels are -100, answer labels are visible for causal LM training.
     Evaluation generates the answer from the prompt with greedy decoding.
 
-This lets you compare TRLM and GPT-2 on the same tokenizer, same prompts,
-same target formatting, same splits, and same numeric exact-match metric.
+This lets you compare TRLM, GPT-2, and Gemma4-Text on the same tokenizer,
+same prompts, same target formatting, same splits, and same numeric exact-match metric.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from tqdm.auto import tqdm
 from transformers import (
     AutoConfig,
+    AutoModelForCausalLM,
     AutoTokenizer,
     GPT2Config,
     GPT2LMHeadModel,
@@ -140,6 +141,10 @@ def numeric_equal(pred: Optional[float], gold: Optional[float], tol: float = 1e-
     if pred is None or gold is None:
         return False
     return abs(pred - gold) <= tol * max(1.0, abs(gold))
+
+
+def is_causal_lm_type(model_type: str) -> bool:
+    return model_type in {"gpt2", "gemma4_text"}
 
 
 # -----------------------------------------------------------------------------
@@ -296,7 +301,7 @@ class MathCollator:
 
             if self.model_type == "trlm":
                 input_ids = prompt_ids + [self.tokenizer.mask_token_id] * len(answer_ids)
-            elif self.model_type == "gpt2":
+            elif is_causal_lm_type(self.model_type):
                 input_ids = prompt_ids + answer_ids
             else:
                 raise ValueError(f"Unsupported model_type: {self.model_type}")
@@ -428,9 +433,23 @@ def build_datasets(args) -> Tuple[Dataset, Dataset, Dataset, Dataset]:
 def resolve_model_type(args) -> str:
     if args.model_type != "auto":
         return args.model_type
-    suffix = Path(args.checkpoint_path).suffix.lower()
-    if suffix == ".safetensors":
+
+    ckpt_path = Path(args.checkpoint_path)
+    if ckpt_path.suffix.lower() == ".safetensors":
+        config_path = ckpt_path.parent / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    model_type = str(json.load(f).get("model_type", "")).lower()
+                if "gemma" in model_type:
+                    return "gemma4_text"
+                if "gpt2" in model_type or "gpt" in model_type:
+                    return "gpt2"
+            except Exception:
+                pass
+        # Backward-compatible default for old GPT-2 safetensors checkpoints.
         return "gpt2"
+
     return "trlm"
 
 
@@ -459,6 +478,11 @@ def load_checkpoint_dict(path: str) -> Tuple[Dict[str, torch.Tensor], Dict[str, 
 
 
 def strip_common_prefixes(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip common wrapper prefixes for TRLM/GPT-2 style checkpoints.
+
+    WARNING: Do not use this blindly for HF Gemma-style models, because
+    `model.` is a real submodule prefix there, not just a wrapper prefix.
+    """
     prefixes = ["module.", "model.", "_orig_mod."]
     out = {}
     for key, value in state.items():
@@ -472,6 +496,81 @@ def strip_common_prefixes(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Ten
                     changed = True
         out[new_key] = value
     return out
+
+
+def strip_wrapper_prefixes(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip only DDP/torch.compile wrapper prefixes.
+
+    Unlike strip_common_prefixes(), this intentionally keeps `model.` because
+    HF Gemma/Gemma-like causal LM classes expect keys such as
+    `model.embed_tokens.weight` and `model.layers.0...`.
+    """
+    prefixes = ["module.", "_orig_mod."]
+    out = {}
+    for key, value in state.items():
+        new_key = key
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if new_key.startswith(prefix):
+                    new_key = new_key[len(prefix):]
+                    changed = True
+        out[new_key] = value
+    return out
+
+
+def align_state_dict_keys_to_model(
+    state: Dict[str, torch.Tensor],
+    model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """Map checkpoint keys to the exact keys expected by `model`.
+
+    This handles the common mismatch where a saved Gemma-like checkpoint uses
+    `embed_tokens.weight` / `layers.0...`, while the HF causal LM wrapper
+    expects `model.embed_tokens.weight` / `model.layers.0...`. It also handles
+    the reverse direction when needed. Keys are remapped only when the target
+    key exists in model.state_dict() and the tensor shape matches.
+    """
+    expected = model.state_dict()
+    aligned: Dict[str, torch.Tensor] = {}
+
+    def unique(seq):
+        seen = set()
+        out = []
+        for item in seq:
+            if item not in seen:
+                out.append(item)
+                seen.add(item)
+        return out
+
+    for key, value in state.items():
+        k = key
+        candidates = [k]
+
+        if k.startswith("model."):
+            candidates.append(k[len("model."):])
+        else:
+            candidates.append("model." + k)
+
+        if k.startswith("language_model."):
+            candidates.append(k[len("language_model."):])
+        else:
+            candidates.append("language_model." + k)
+
+        if k.startswith("language_model.model."):
+            candidates.append(k[len("language_model."):])
+            candidates.append(k[len("language_model.model."):])
+
+        chosen = k
+        for cand in unique(candidates):
+            if cand in expected and tuple(expected[cand].shape) == tuple(value.shape):
+                chosen = cand
+                break
+
+        aligned[chosen] = value
+
+    return aligned
 
 
 def infer_gpt2_config_from_state(
@@ -613,11 +712,137 @@ def load_gpt2_model(args, tokenizer) -> GPT2LMHeadModel:
     return model
 
 
+def build_gemma4_text_config(args, tokenizer, state: Dict[str, torch.Tensor]):
+    """Build a Gemma4-Text config when config.json is not available.
+
+    This requires the local transformers installation to know the `gemma4_text`
+    model type. In the environment used for pretraining, run_clm.py already
+    used `--model_type gemma4_text`, so AutoConfig.for_model should work there.
+    """
+    state = strip_wrapper_prefixes(state)
+    vocab_size = len(tokenizer)
+
+    # Prefer the checkpoint embedding shape if present.
+    for key in ("model.embed_tokens.weight", "embed_tokens.weight", "language_model.model.embed_tokens.weight"):
+        if key in state:
+            vocab_size = int(state[key].shape[0])
+            break
+
+    kwargs = dict(
+        vocab_size=vocab_size,
+        hidden_size=args.gemma_hidden_size,
+        intermediate_size=args.gemma_intermediate_size,
+        num_hidden_layers=args.gemma_num_hidden_layers,
+        num_attention_heads=args.gemma_num_attention_heads,
+        num_key_value_heads=args.gemma_num_key_value_heads,
+        head_dim=args.gemma_head_dim,
+        global_head_dim=args.gemma_global_head_dim,
+        max_position_embeddings=args.max_seq_len,
+        hidden_activation=args.gemma_hidden_activation,
+        rms_norm_eps=args.gemma_rms_norm_eps,
+        attention_bias=args.gemma_attention_bias,
+        attention_dropout=args.gemma_attention_dropout,
+        sliding_window=args.gemma_sliding_window,
+        hidden_size_per_layer_input=args.gemma_hidden_size_per_layer_input,
+        use_cache=False,
+        tie_word_embeddings=args.gemma_tie_word_embeddings,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        bos_token_id=tokenizer.bos_token_id if tokenizer.bos_token_id is not None else tokenizer.eos_token_id,
+    )
+
+    try:
+        return AutoConfig.for_model(args.gemma_auto_model_type, **kwargs)
+    except Exception as exc:
+        raise ValueError(
+            "Could not build Gemma4-Text config automatically. Provide --gemma_config_path "
+            "or place config.json next to model.safetensors. Original error: " + str(exc)
+        ) from exc
+
+
+def load_gemma4_text_model(args, tokenizer):
+    state, _ = load_checkpoint_dict(args.checkpoint_path)
+    # For Gemma-like HF causal LM models, `model.` is a real submodule prefix.
+    # Only strip DDP/compile wrappers here; do NOT strip `model.` blindly.
+    state = strip_wrapper_prefixes(state)
+
+    checkpoint_dir = Path(args.checkpoint_path).parent
+
+    if args.gemma_config_path:
+        config = AutoConfig.from_pretrained(
+            args.gemma_config_path,
+            trust_remote_code=args.trust_remote_code,
+        )
+    elif (checkpoint_dir / "config.json").exists():
+        config = AutoConfig.from_pretrained(
+            str(checkpoint_dir),
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        config = build_gemma4_text_config(args, tokenizer, state)
+
+    config.pad_token_id = tokenizer.pad_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        config.bos_token_id = tokenizer.bos_token_id
+    if hasattr(config, "use_cache"):
+        config.use_cache = False
+
+    if int(config.vocab_size) != int(len(tokenizer)):
+        msg = f"Gemma4-Text vocab mismatch: config/checkpoint vocab_size={config.vocab_size}, len(tokenizer)={len(tokenizer)}."
+        if args.allow_resize_token_embeddings:
+            print("[WARN] " + msg + " Resizing token embeddings after loading.")
+        else:
+            raise ValueError(msg + " Use the same tokenizer or pass --allow_resize_token_embeddings.")
+
+    model = AutoModelForCausalLM.from_config(
+        config,
+        trust_remote_code=args.trust_remote_code,
+    )
+
+    state = align_state_dict_keys_to_model(state, model)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    if int(model.config.vocab_size) != int(len(tokenizer)) and args.allow_resize_token_embeddings:
+        model.resize_token_embeddings(len(tokenizer))
+        model.config.vocab_size = len(tokenizer)
+
+    print(f"Loaded Gemma4-Text checkpoint: {args.checkpoint_path}")
+    print(
+        "Gemma4-Text config: "
+        f"layers={getattr(model.config, 'num_hidden_layers', 'NA')}, "
+        f"hidden={getattr(model.config, 'hidden_size', 'NA')}, "
+        f"heads={getattr(model.config, 'num_attention_heads', 'NA')}, "
+        f"kv_heads={getattr(model.config, 'num_key_value_heads', 'NA')}, "
+        f"intermediate={getattr(model.config, 'intermediate_size', 'NA')}"
+    )
+    print(f"Missing keys: {len(missing)} | Unexpected keys: {len(unexpected)}")
+    if missing:
+        print(f"First missing keys: {missing[:10]}")
+    if unexpected:
+        print(f"First unexpected keys: {unexpected[:10]}")
+
+    # Large missing/unexpected lists usually mean the pretrained checkpoint was
+    # not loaded at all. Fail fast instead of silently fine-tuning a random model.
+    allowed_missing_suffixes = ("rotary_emb.inv_freq",)
+    serious_missing = [k for k in missing if not k.endswith(allowed_missing_suffixes)]
+    if len(serious_missing) > 10 or len(unexpected) > 10:
+        raise RuntimeError(
+            "Gemma4-Text checkpoint did not load cleanly. "
+            f"Serious missing keys: {len(serious_missing)}, unexpected keys: {len(unexpected)}. "
+            "This usually indicates a key-prefix or model-class mismatch."
+        )
+
+    return model
+
+
 def load_model(args, tokenizer):
     if args.model_type_resolved == "trlm":
         return load_trlm_model(args, tokenizer)
     if args.model_type_resolved == "gpt2":
         return load_gpt2_model(args, tokenizer)
+    if args.model_type_resolved == "gemma4_text":
+        return load_gemma4_text_model(args, tokenizer)
     raise ValueError(f"Unsupported model_type: {args.model_type_resolved}")
 
 
@@ -635,7 +860,7 @@ def save_checkpoint(
     out = Path(output_dir) / name
     out.mkdir(parents=True, exist_ok=True)
 
-    if args.model_type_resolved == "gpt2":
+    if is_causal_lm_type(args.model_type_resolved):
         model.save_pretrained(out, safe_serialization=True)
         tokenizer.save_pretrained(out)
         train_state = {
@@ -734,7 +959,7 @@ def generate_trlm(model: TRLM, batch: Dict[str, Any], tokenizer, args) -> torch.
 
 
 @torch.no_grad()
-def generate_gpt2(model: GPT2LMHeadModel, batch: Dict[str, Any], tokenizer, args, device: torch.device) -> torch.Tensor:
+def generate_causal_lm(model, batch: Dict[str, Any], tokenizer, args, device: torch.device) -> torch.Tensor:
     input_ids = batch["input_ids"]
     prompt_lens = batch["prompt_lens"].detach().cpu().tolist()
     answer_lens = batch["answer_lens"].detach().cpu().tolist()
@@ -817,7 +1042,7 @@ def evaluate_generation(
         if args.model_type_resolved == "trlm":
             generated = generate_trlm(model, batch, tokenizer, args).detach().cpu()
         else:
-            generated = generate_gpt2(model, batch, tokenizer, args, device).detach().cpu()
+            generated = generate_causal_lm(model, batch, tokenizer, args, device).detach().cpu()
 
         prompt_lens = batch["prompt_lens"].detach().cpu().tolist()
         answer_lens = batch["answer_lens"].detach().cpu().tolist()
@@ -1100,10 +1325,10 @@ def train(args) -> None:
 # -----------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune TRLM or GPT-2 on GSM8K + SVAMP.")
+    parser = argparse.ArgumentParser(description="Fine-tune TRLM, GPT-2, or Gemma4-Text on GSM8K + SVAMP.")
 
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2"])
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt or GPT-2 .safetensors/.pt checkpoint path")
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2", "gemma4_text"])
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt, GPT-2 .safetensors/.pt, or Gemma4-Text checkpoint path")
     parser.add_argument("--tokenizer_name", type=str, default="DogaOytc/TRLM-tokenizer")
     parser.add_argument("--output_dir", type=str, default="checkpoints_math")
     parser.add_argument("--hf_token_env", type=str, default="HF_TOKEN")
@@ -1157,6 +1382,25 @@ def parse_args():
     parser.add_argument("--gpt2_extra_new_tokens", type=int, default=0)
     parser.add_argument("--gpt2_decode_gold_length", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow_resize_token_embeddings", action="store_true")
+
+    # Gemma4-Text loading knobs. These are only used when config.json is absent.
+    parser.add_argument("--gemma_config_path", type=str, default=None, help="Optional Gemma4-Text config path or directory. Defaults to checkpoint dir/config.json if present.")
+    parser.add_argument("--gemma_auto_model_type", type=str, default="gemma4_text", help="AutoConfig model_type to use when no config.json exists.")
+    parser.add_argument("--gemma_hidden_size", type=int, default=512)
+    parser.add_argument("--gemma_intermediate_size", type=int, default=2304)
+    parser.add_argument("--gemma_num_hidden_layers", type=int, default=12)
+    parser.add_argument("--gemma_num_attention_heads", type=int, default=8)
+    parser.add_argument("--gemma_num_key_value_heads", type=int, default=4)
+    parser.add_argument("--gemma_head_dim", type=int, default=64)
+    parser.add_argument("--gemma_global_head_dim", type=int, default=64)
+    parser.add_argument("--gemma_hidden_activation", type=str, default="gelu_pytorch_tanh")
+    parser.add_argument("--gemma_rms_norm_eps", type=float, default=1e-6)
+    parser.add_argument("--gemma_attention_bias", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--gemma_attention_dropout", type=float, default=0.0)
+    parser.add_argument("--gemma_sliding_window", type=int, default=512)
+    parser.add_argument("--gemma_hidden_size_per_layer_input", type=int, default=0)
+    parser.add_argument("--gemma_tie_word_embeddings", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--trust_remote_code", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--answer_tolerance", type=float, default=1e-4)
     parser.add_argument("--logging_steps", type=int, default=10)

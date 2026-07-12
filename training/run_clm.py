@@ -46,6 +46,9 @@ import datasets
 import evaluate
 import torch
 from datasets import IterableDataset, IterableDatasetDict, interleave_datasets, load_dataset
+from transformers.trainer_callback import ProgressCallback
+from transformers.trainer_utils import has_length
+from tqdm.auto import tqdm
 
 import transformers
 from transformers import (
@@ -192,6 +195,15 @@ class DataTrainingArguments:
             "help": (
                 "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
                 "value if set."
+            )
+        },
+    )
+    eval_progress_update_steps: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Evaluation progress bar kaç prediction step'te bir güncellensin. "
+                "1 varsayılan HF davranışı, 50 daha seyrek çıktı verir."
             )
         },
     )
@@ -410,6 +422,135 @@ def add_perplexity(metrics: dict, loss_key: str, output_key: str) -> None:
     if loss_key in metrics:
         metrics[output_key] = safe_exp(metrics[loss_key])
 
+
+def _default_gemma4_text_layer_types(num_hidden_layers: int, sliding_window_pattern: int = 6) -> list[str]:
+    """Build Gemma4Text default 5:1 local/global attention pattern for a custom depth."""
+    if num_hidden_layers < 1:
+        raise ValueError(f"num_hidden_layers must be >= 1 for gemma4_text, got {num_hidden_layers}")
+
+    layer_types = [
+        "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
+        for i in range(num_hidden_layers)
+    ]
+    # Gemma4Text expects the last layer to be full attention.
+    layer_types[-1] = "full_attention"
+    return layer_types
+
+
+def normalize_gemma4_text_config(config) -> None:
+    """
+    Keep Gemma4TextConfig internally consistent after --config_overrides.
+
+    Gemma4TextConfig creates `layer_types` in __post_init__ using the default depth.
+    If `num_hidden_layers` is later changed via config.update_from_string(), the old
+    `layer_types` list can remain at the default length and save_pretrained() fails
+    strict validation with:
+        `num_hidden_layers` must be equal to the number of `layer_types`.
+
+    This is intentionally scoped to gemma4_text so the same run_clm.py can still train
+    other architectures without modifying their configs.
+    """
+    if getattr(config, "model_type", None) != "gemma4_text":
+        return
+
+    try:
+        num_hidden_layers = int(getattr(config, "num_hidden_layers"))
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"gemma4_text config has invalid num_hidden_layers={getattr(config, 'num_hidden_layers', None)!r}"
+        )
+
+    layer_types = getattr(config, "layer_types", None)
+    valid_layer_types = {"sliding_attention", "full_attention"}
+    should_rebuild_layer_types = False
+
+    if layer_types is None:
+        should_rebuild_layer_types = True
+    else:
+        layer_types = list(layer_types)
+        if len(layer_types) != num_hidden_layers:
+            logger.warning(
+                "gemma4_text layer_types length (%s) does not match num_hidden_layers (%s); "
+                "rebuilding layer_types with the default 5:1 sliding/full pattern.",
+                len(layer_types),
+                num_hidden_layers,
+            )
+            should_rebuild_layer_types = True
+        elif any(layer_type not in valid_layer_types for layer_type in layer_types):
+            logger.warning(
+                "gemma4_text layer_types contains invalid values %s; rebuilding layer_types.",
+                sorted(set(layer_types) - valid_layer_types),
+            )
+            should_rebuild_layer_types = True
+
+    if should_rebuild_layer_types:
+        config.layer_types = _default_gemma4_text_layer_types(num_hidden_layers)
+    else:
+        config.layer_types = layer_types
+        if config.layer_types[-1] != "full_attention":
+            logger.warning(
+                "gemma4_text last layer must be full_attention, got %s; forcing it to full_attention.",
+                config.layer_types[-1],
+            )
+            config.layer_types[-1] = "full_attention"
+
+    if len(config.layer_types) != num_hidden_layers:
+        raise ValueError(
+            "gemma4_text config normalization failed: "
+            f"num_hidden_layers={num_hidden_layers}, len(layer_types)={len(config.layer_types)}"
+        )
+
+
+class SparseEvalProgressCallback(ProgressCallback):
+    """
+    Default Hugging Face progress callback'inin eval progress bar güncellemesini seyrekleştirir.
+
+    Normalde evaluation sırasında tqdm her prediction step'te update edilir.
+    Bu callback ile örn. eval_progress_update_steps=50 yapınca progress bar 50 step'te bir güncellenir.
+    """
+
+    def __init__(self, eval_progress_update_steps: int = 1):
+        super().__init__()
+        self.eval_progress_update_steps = max(1, int(eval_progress_update_steps))
+        self._pending_eval_updates = 0
+
+    def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
+        if self.eval_progress_update_steps <= 1:
+            return super().on_prediction_step(
+                args,
+                state,
+                control,
+                eval_dataloader=eval_dataloader,
+                **kwargs,
+            )
+
+        if state.is_local_process_zero and has_length(eval_dataloader):
+            if self.prediction_bar is None:
+                self.prediction_bar = tqdm(
+                    total=len(eval_dataloader),
+                    leave=self.training_bar is None,
+                    dynamic_ncols=True,
+                )
+                self._pending_eval_updates = 0
+
+            self._pending_eval_updates += 1
+
+            if self._pending_eval_updates >= self.eval_progress_update_steps:
+                self.prediction_bar.update(self._pending_eval_updates)
+                self._pending_eval_updates = 0
+
+    def _flush_eval_updates(self):
+        if self.prediction_bar is not None and self._pending_eval_updates > 0:
+            self.prediction_bar.update(self._pending_eval_updates)
+        self._pending_eval_updates = 0
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        self._flush_eval_updates()
+        return super().on_evaluate(args, state, control, **kwargs)
+
+    def on_predict(self, args, state, control, **kwargs):
+        self._flush_eval_updates()
+        return super().on_predict(args, state, control, **kwargs)
 
 class TokenAccountingTrainer(Trainer):
     """
@@ -656,6 +797,8 @@ def main():
 
             logger.info(f"New config: {config}")
 
+    normalize_gemma4_text_config(config)
+
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
@@ -876,7 +1019,6 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         processing_class=tokenizer,
-        # Data collator will default to DataCollatorWithPadding, so we change it.
         data_collator=default_data_collator,
         compute_metrics=compute_metrics if training_args.do_eval and not is_torch_xla_available() else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics
@@ -894,6 +1036,10 @@ def main():
         f"loss_tokens_per_train_step={trainer.loss_tokens_per_train_step}, "
         f"planned_train_input_tokens={training_args.max_steps * trainer.tokens_per_train_step if training_args.max_steps > 0 else 'unknown'}"
     )
+
+    if not training_args.disable_tqdm:
+        trainer.remove_callback(ProgressCallback)
+        trainer.add_callback(SparseEvalProgressCallback(data_args.eval_progress_update_steps))
 
     # Training
     if training_args.do_train:
