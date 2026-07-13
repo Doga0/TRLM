@@ -45,6 +45,7 @@ from itertools import chain
 import datasets
 import evaluate
 import torch
+import torch.nn.functional as F
 from datasets import IterableDataset, IterableDatasetDict, interleave_datasets, load_dataset
 from transformers.trainer_callback import ProgressCallback
 from transformers.trainer_utils import has_length
@@ -258,6 +259,23 @@ class DataTrainingArguments:
     mix_seed: int = field(
         default=42, metadata={"help": "Seed for shuffling and 50/50 interleaving."}
     )
+    diffusion_min_noise: float = field(
+        default=0.05,
+        metadata={"help": "Minimum uniform-token corruption probability for DiffusionGemma training."},
+    )
+    diffusion_max_noise: float = field(
+        default=1.0,
+        metadata={"help": "Maximum uniform-token corruption probability for DiffusionGemma training."},
+    )
+    diffusion_self_conditioning_probability: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Probability of using an additional no-grad first pass for DiffusionGemma "
+                "self-conditioning. Start with 0.0 for stability; 0.5 costs roughly 50% more forwards."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.streaming:
@@ -392,9 +410,6 @@ def build_trlm_mixed_streaming_dataset(data_args, model_args):
 
     return split_streaming_dataset(mixed_train_stream, data_args.validation_split_percentage)
 
-
-
-
 def safe_exp(value):
     """Compute exp(value) safely for perplexity logging."""
     try:
@@ -423,44 +438,305 @@ def add_perplexity(metrics: dict, loss_key: str, output_key: str) -> None:
         metrics[output_key] = safe_exp(metrics[loss_key])
 
 
-def _default_gemma4_text_layer_types(num_hidden_layers: int, sliding_window_pattern: int = 6) -> list[str]:
-    """Build Gemma4Text default 5:1 local/global attention pattern for a custom depth."""
+def _parse_config_override_value(value: str):
+    """Parse a Hugging Face --config_overrides value into a Python value."""
+    value = value.strip()
+    lower = value.lower()
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    if lower in {"none", "null"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def _get_text_config_for_overrides(config):
+    """Return the nested text config for multimodal DiffusionGemma-style configs."""
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+    return config
+
+
+def apply_config_overrides(config, overrides: str) -> None:
+    """
+    Apply --config_overrides safely to both flat text configs and nested configs.
+
+    DiffusionGemmaConfig keeps language-model fields such as hidden_size,
+    intermediate_size, num_hidden_layers, etc. under config.text_config.
+    Some Gemma4Text-only keys may not exist in DiffusionGemmaTextConfig;
+    harmless compatibility keys are skipped with a warning instead of crashing.
+    """
+    if overrides is None:
+        return
+
+    text_config = _get_text_config_for_overrides(config)
+
+    # These are compatibility overrides used by Gemma4Text/Gemma causal-LM configs
+    # in some Transformers versions, but they are not exposed by
+    # DiffusionGemmaTextConfig. If they are absent, skipping them preserves the
+    # model defaults and prevents scratch-config construction from crashing.
+    ignored_if_missing = {
+        "hidden_size_per_layer_input",
+        "use_cache",
+    }
+
+    for item in overrides.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid config override item: {item!r}. Expected key=value.")
+
+        key, value = item.split("=", 1)
+        key = key.strip()
+        parsed_value = _parse_config_override_value(value)
+
+        # DiffusionGemmaTextConfig validates this field as Literal["all", "vision"] | None,
+        # not as a boolean. Accept convenient true/false command-line values anyway.
+        if key == "use_bidirectional_attention":
+            if parsed_value is True:
+                parsed_value = "all"
+            elif parsed_value is False:
+                parsed_value = None
+
+        if hasattr(config, key):
+            setattr(config, key, parsed_value)
+        elif text_config is not config and hasattr(text_config, key):
+            setattr(text_config, key, parsed_value)
+        elif key in ignored_if_missing:
+            logger.warning(
+                "Skipping config override %s=%r because it is not present in %s/%s. "
+                "This is expected for DiffusionGemmaTextConfig.",
+                key,
+                parsed_value,
+                getattr(config, "model_type", None),
+                getattr(text_config, "model_type", None),
+            )
+        else:
+            raise ValueError(
+                f"key {key!r} is not present in the top-level config or nested text_config. "
+                f"Top-level model_type={getattr(config, 'model_type', None)!r}, "
+                f"text model_type={getattr(text_config, 'model_type', None)!r}"
+            )
+
+
+def _set_if_present(obj, key: str, value) -> None:
+    if obj is not None and hasattr(obj, key) and value is not None:
+        setattr(obj, key, value)
+
+
+def sync_tokenizer_ids_to_config(config, tokenizer, block_size: int | None = None) -> None:
+    """Mirror tokenizer-dependent fields into both top-level and nested text configs."""
+    targets = [config]
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        targets.append(text_config)
+
+    for target in targets:
+        _set_if_present(target, "vocab_size", len(tokenizer))
+        # Token ids are also stored on the top-level DiffusionGemmaConfig for
+        # Trainer/generation synchronization, even though the embedding lives
+        # under text_config. PreTrainedConfig permits these attributes.
+        if tokenizer.bos_token_id is not None:
+            setattr(target, "bos_token_id", tokenizer.bos_token_id)
+        if tokenizer.eos_token_id is not None:
+            setattr(target, "eos_token_id", tokenizer.eos_token_id)
+        if tokenizer.pad_token_id is not None:
+            setattr(target, "pad_token_id", tokenizer.pad_token_id)
+        if block_size is not None:
+            _set_if_present(target, "max_position_embeddings", block_size)
+
+
+def is_diffusion_gemma_config(config) -> bool:
+    """Return True for the top-level DiffusionGemmaConfig."""
+    return getattr(config, "model_type", None) == "diffusion_gemma"
+
+
+def patch_diffusion_gemma_text_only_encoder() -> None:
+    """
+    Patch Transformers 5.13.x so DiffusionGemma can be instantiated with
+    ``vision_config=None``.
+
+    The released configuration class explicitly permits ``vision_config=None``,
+    but DiffusionGemmaEncoderModel.__init__ still creates the vision tower and
+    multimodal projector unconditionally. For text-only training we replace only
+    that constructor; all original text forward/masking/cache methods remain in
+    use, and no vision parameters are created or saved.
+    """
+    try:
+        from transformers.models.diffusion_gemma import modeling_diffusion_gemma as dg_modeling
+    except ImportError as exc:
+        raise ImportError(
+            "Could not import Transformers DiffusionGemma modeling code. "
+            "Install a Transformers version that contains DiffusionGemma support."
+        ) from exc
+
+    encoder_cls = dg_modeling.DiffusionGemmaEncoderModel
+    if getattr(encoder_cls, "_trlm_text_only_constructor_patch", False):
+        return
+
+    def text_only_encoder_init(self, config):
+        dg_modeling.DiffusionGemmaPreTrainedModel.__init__(self, config)
+        self.vocab_size = config.text_config.vocab_size
+        self.language_model = dg_modeling.DiffusionGemmaEncoderTextModel(
+            config=config.text_config
+        )
+        # Keep the public attributes explicit so accidental image input fails
+        # clearly instead of silently creating an unused vision network.
+        self.vision_tower = None
+        self.embed_vision = None
+        self.post_init()
+
+    encoder_cls.__init__ = text_only_encoder_init
+    encoder_cls._trlm_text_only_constructor_patch = True
+    logger.info(
+        "Applied text-only DiffusionGemma encoder patch: vision tower and "
+        "multimodal projector will not be instantiated."
+    )
+
+
+def build_model_from_config(config, model_args):
+    """Instantiate a model from config, including non-AutoModelForCausalLM configs.
+
+    DiffusionGemmaConfig is not registered under AutoModelForCausalLM because
+    it is a block-diffusion model, not a standard left-to-right causal LM.
+    It must be instantiated with DiffusionGemmaForBlockDiffusion.
+    """
+    if is_diffusion_gemma_config(config):
+        config.vision_config = None
+        patch_diffusion_gemma_text_only_encoder()
+        try:
+            from transformers import DiffusionGemmaForBlockDiffusion
+        except ImportError as exc:
+            raise ImportError(
+                "DiffusionGemmaForBlockDiffusion could not be imported. "
+                "Install a Transformers version that includes DiffusionGemma support, "
+                "for example the same version used by your logs: transformers>=5.11."
+            ) from exc
+
+        logger.info("Instantiating DiffusionGemmaForBlockDiffusion from scratch.")
+        return DiffusionGemmaForBlockDiffusion(config)
+
+    return AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+
+
+def load_model_from_pretrained(model_args, config, dtype):
+    """Load pretrained model, including DiffusionGemma checkpoints."""
+    if is_diffusion_gemma_config(config):
+        config.vision_config = None
+        patch_diffusion_gemma_text_only_encoder()
+        try:
+            from transformers import DiffusionGemmaForBlockDiffusion
+        except ImportError as exc:
+            raise ImportError(
+                "DiffusionGemmaForBlockDiffusion could not be imported. "
+                "Install a Transformers version that includes DiffusionGemma support."
+            ) from exc
+
+        logger.info("Loading DiffusionGemmaForBlockDiffusion checkpoint: %s", model_args.model_name_or_path)
+        return DiffusionGemmaForBlockDiffusion.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+            dtype=dtype,
+        )
+
+    return AutoModelForCausalLM.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
+        dtype=dtype,
+    )
+
+def _default_gemma4_layer_types(num_hidden_layers: int, sliding_window_pattern: int = 6) -> list[str]:
+    """Build default 5:1 local/global attention pattern for a custom depth."""
     if num_hidden_layers < 1:
-        raise ValueError(f"num_hidden_layers must be >= 1 for gemma4_text, got {num_hidden_layers}")
+        raise ValueError(f"num_hidden_layers must be >= 1, got {num_hidden_layers}")
 
     layer_types = [
         "sliding_attention" if bool((i + 1) % sliding_window_pattern) else "full_attention"
         for i in range(num_hidden_layers)
     ]
-    # Gemma4Text expects the last layer to be full attention.
+    # Gemma architectures expect the last layer to be full attention.
     layer_types[-1] = "full_attention"
     return layer_types
 
 
-def normalize_gemma4_text_config(config) -> None:
-    """
-    Keep Gemma4TextConfig internally consistent after --config_overrides.
 
-    Gemma4TextConfig creates `layer_types` in __post_init__ using the default depth.
-    If `num_hidden_layers` is later changed via config.update_from_string(), the old
-    `layer_types` list can remain at the default length and save_pretrained() fails
-    strict validation with:
-        `num_hidden_layers` must be equal to the number of `layer_types`.
-
-    This is intentionally scoped to gemma4_text so the same run_clm.py can still train
-    other architectures without modifying their configs.
-    """
-    if getattr(config, "model_type", None) != "gemma4_text":
+def configure_diffusion_gemma_text_only(config) -> None:
+    """Disable all vision-side configuration for text-only DiffusionGemma."""
+    if not is_diffusion_gemma_config(config):
         return
 
+    if getattr(config, "vision_config", None) is not None:
+        logger.warning(
+            "Discarding diffusion_gemma vision_config because this run is text-only."
+        )
+    config.vision_config = None
+
+
+def normalize_gemma4_config(config) -> None:
+    """
+    Keep Gemma4Text and nested DiffusionGemma text configs internally consistent.
+    """
+    model_type = getattr(config, "model_type", None)
+    if model_type not in ["gemma4_text", "diffusion_gemma"]:
+        return
+
+    target_config = _get_text_config_for_overrides(config)
+
+    if model_type == "diffusion_gemma":
+        configure_diffusion_gemma_text_only(config)
+
+    if model_type == "diffusion_gemma":
+        if hasattr(target_config, "num_experts") and getattr(target_config, "num_experts", None) is None:
+            logger.warning(
+                "diffusion_gemma text_config.num_experts is None; setting num_experts=1 "
+                "for a dense single-expert baseline."
+            )
+            target_config.num_experts = 1
+
+        if hasattr(target_config, "top_k_experts") and getattr(target_config, "top_k_experts", None) is None:
+            target_config.top_k_experts = 1
+
+        if hasattr(target_config, "moe_intermediate_size") and getattr(target_config, "moe_intermediate_size", None) is None:
+            target_config.moe_intermediate_size = int(getattr(target_config, "intermediate_size"))
+
+        if hasattr(target_config, "num_global_key_value_heads") and getattr(target_config, "num_global_key_value_heads", None) is None:
+            # Keep global attention KV grouping consistent with normal GQA unless
+            # the config or command line provides a separate value.
+            target_config.num_global_key_value_heads = int(getattr(target_config, "num_key_value_heads"))
+
+        # Keep ``use_bidirectional_attention=None`` for the encoder.
+        # DiffusionGemma's prompt encoder is causal; its canvas decoder is
+        # bidirectional unconditionally inside DiffusionGemmaDecoderTextAttention.
+        # Setting this to "all" would incorrectly make the prompt encoder
+        # bidirectional and would break block-autoregressive cache semantics.
+
     try:
-        num_hidden_layers = int(getattr(config, "num_hidden_layers"))
-    except (TypeError, ValueError):
+        num_hidden_layers = int(getattr(target_config, "num_hidden_layers"))
+    except (TypeError, ValueError, AttributeError):
         raise ValueError(
-            f"gemma4_text config has invalid num_hidden_layers={getattr(config, 'num_hidden_layers', None)!r}"
+            f"{model_type} text config has invalid num_hidden_layers="
+            f"{getattr(target_config, 'num_hidden_layers', None)!r}"
         )
 
-    layer_types = getattr(config, "layer_types", None)
+    layer_types = getattr(target_config, "layer_types", None)
     valid_layer_types = {"sliding_attention", "full_attention"}
     should_rebuild_layer_types = False
 
@@ -470,34 +746,37 @@ def normalize_gemma4_text_config(config) -> None:
         layer_types = list(layer_types)
         if len(layer_types) != num_hidden_layers:
             logger.warning(
-                "gemma4_text layer_types length (%s) does not match num_hidden_layers (%s); "
+                "%s layer_types length (%s) does not match num_hidden_layers (%s); "
                 "rebuilding layer_types with the default 5:1 sliding/full pattern.",
+                model_type,
                 len(layer_types),
                 num_hidden_layers,
             )
             should_rebuild_layer_types = True
         elif any(layer_type not in valid_layer_types for layer_type in layer_types):
             logger.warning(
-                "gemma4_text layer_types contains invalid values %s; rebuilding layer_types.",
+                "%s layer_types contains invalid values %s; rebuilding layer_types.",
+                model_type,
                 sorted(set(layer_types) - valid_layer_types),
             )
             should_rebuild_layer_types = True
 
     if should_rebuild_layer_types:
-        config.layer_types = _default_gemma4_text_layer_types(num_hidden_layers)
+        target_config.layer_types = _default_gemma4_layer_types(num_hidden_layers)
     else:
-        config.layer_types = layer_types
-        if config.layer_types[-1] != "full_attention":
+        target_config.layer_types = layer_types
+        if target_config.layer_types[-1] != "full_attention":
             logger.warning(
-                "gemma4_text last layer must be full_attention, got %s; forcing it to full_attention.",
-                config.layer_types[-1],
+                "%s last layer must be full_attention, got %s; forcing it to full_attention.",
+                model_type,
+                target_config.layer_types[-1],
             )
-            config.layer_types[-1] = "full_attention"
+            target_config.layer_types[-1] = "full_attention"
 
-    if len(config.layer_types) != num_hidden_layers:
+    if len(target_config.layer_types) != num_hidden_layers:
         raise ValueError(
-            "gemma4_text config normalization failed: "
-            f"num_hidden_layers={num_hidden_layers}, len(layer_types)={len(config.layer_types)}"
+            f"{model_type} config normalization failed: "
+            f"num_hidden_layers={num_hidden_layers}, len(layer_types)={len(target_config.layer_types)}"
         )
 
 
@@ -554,23 +833,79 @@ class SparseEvalProgressCallback(ProgressCallback):
 
 class TokenAccountingTrainer(Trainer):
     """
-    Trainer that adds token-budget metrics to every train/eval log.
+    Trainer with token accounting and a DiffusionGemma block-denoising objective.
 
-    For causal LM, the model receives `block_size` input tokens per sequence,
-    while the next-token loss is computed over approximately `block_size - 1`
-    target tokens because labels are shifted internally by the model.
+    For DiffusionGemma, each fixed-length sample is split into:
+      * causal encoder context: ``block_size - canvas_length`` tokens
+      * clean decoder canvas: ``canvas_length`` tokens
+
+    The clean canvas is corrupted with uniform random vocabulary tokens. The
+    model predicts the clean canvas bidirectionally and cross-entropy is applied
+    only at corrupted positions, with inverse corruption-probability weighting.
     """
 
-    def __init__(self, *args, block_size: int, eval_samples: int | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        block_size: int,
+        eval_samples: int | None = None,
+        diffusion_min_noise: float = 0.05,
+        diffusion_max_noise: float = 1.0,
+        diffusion_self_conditioning_probability: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.block_size = int(block_size)
-        self.target_tokens_per_sequence = max(1, self.block_size - 1)
         self.effective_train_batch_size = get_effective_train_batch_size(self.args)
         self.tokens_per_train_step = self.effective_train_batch_size * self.block_size
-        self.loss_tokens_per_train_step = self.effective_train_batch_size * self.target_tokens_per_sequence
         self.eval_samples = eval_samples
         self.eval_tokens = None if eval_samples is None else int(eval_samples) * self.block_size
-        self.eval_loss_tokens = None if eval_samples is None else int(eval_samples) * self.target_tokens_per_sequence
+
+        self.is_diffusion_gemma = is_diffusion_gemma_config(self.model.config)
+        self.canvas_length = (
+            int(getattr(self.model.config, "canvas_length", 256))
+            if self.is_diffusion_gemma
+            else 0
+        )
+        if self.is_diffusion_gemma:
+            if not 0 < self.canvas_length < self.block_size:
+                raise ValueError(
+                    "DiffusionGemma requires 0 < canvas_length < block_size, got "
+                    f"canvas_length={self.canvas_length}, block_size={self.block_size}."
+                )
+            text_config = getattr(self.model.config, "text_config", self.model.config)
+            self.diffusion_vocab_size = int(text_config.vocab_size)
+            self.diffusion_min_noise = float(diffusion_min_noise)
+            self.diffusion_max_noise = float(diffusion_max_noise)
+            self.diffusion_self_conditioning_probability = float(
+                diffusion_self_conditioning_probability
+            )
+            if not 0.0 < self.diffusion_min_noise <= self.diffusion_max_noise <= 1.0:
+                raise ValueError(
+                    "Expected 0 < diffusion_min_noise <= diffusion_max_noise <= 1, got "
+                    f"{self.diffusion_min_noise}, {self.diffusion_max_noise}."
+                )
+            if not 0.0 <= self.diffusion_self_conditioning_probability <= 1.0:
+                raise ValueError(
+                    "diffusion_self_conditioning_probability must be in [0, 1]."
+                )
+            # Trainer's prediction_step uses label_names to decide whether it
+            # should call compute_loss during evaluation. Keep the dataset's
+            # full clean sequence under `labels` and consume it here.
+            self.label_names = ["labels"]
+            self.target_tokens_per_sequence = self.canvas_length
+        else:
+            self.target_tokens_per_sequence = max(1, self.block_size - 1)
+
+        self.loss_tokens_per_train_step = (
+            self.effective_train_batch_size * self.target_tokens_per_sequence
+        )
+        self.eval_loss_tokens = (
+            None
+            if eval_samples is None
+            else int(eval_samples) * self.target_tokens_per_sequence
+        )
+        self._eval_noise_generator = None
 
     def _train_input_tokens_seen(self) -> int:
         return int(self.state.global_step) * self.tokens_per_train_step
@@ -578,26 +913,193 @@ class TokenAccountingTrainer(Trainer):
     def _train_loss_tokens_seen(self) -> int:
         return int(self.state.global_step) * self.loss_tokens_per_train_step
 
+    def _rand(self, shape, *, device, dtype=torch.float32):
+        generator = None if self.model.training else self._eval_noise_generator
+        return torch.rand(shape, device=device, dtype=dtype, generator=generator)
+
+    def _randint(self, high: int, shape, *, device):
+        generator = None if self.model.training else self._eval_noise_generator
+        return torch.randint(0, high, shape, device=device, generator=generator)
+
+    def _build_noisy_canvas(self, clean_canvas: torch.Tensor):
+        batch_size, canvas_length = clean_canvas.shape
+        device = clean_canvas.device
+
+        if self.model.training:
+            noise_probability = self._rand(
+                (batch_size, 1), device=device, dtype=torch.float32
+            )
+            noise_probability = (
+                self.diffusion_min_noise
+                + noise_probability
+                * (self.diffusion_max_noise - self.diffusion_min_noise)
+            )
+        else:
+            # Fixed 50% corruption gives a stable validation target. The
+            # generator is re-seeded at the start of every evaluate() call.
+            noise_probability = torch.full(
+                (batch_size, 1), 0.5, device=device, dtype=torch.float32
+            )
+
+        corruption_mask = self._rand(
+            (batch_size, canvas_length), device=device, dtype=torch.float32
+        ) < noise_probability
+
+        # Guarantee at least one supervised position per sequence.
+        empty_rows = ~corruption_mask.any(dim=1)
+        if empty_rows.any():
+            forced_positions = self._randint(
+                canvas_length, (int(empty_rows.sum().item()),), device=device
+            )
+            corruption_mask[empty_rows, forced_positions] = True
+
+        random_tokens = self._randint(
+            self.diffusion_vocab_size, clean_canvas.shape, device=device
+        )
+        noisy_canvas = torch.where(corruption_mask, random_tokens, clean_canvas)
+        return noisy_canvas, corruption_mask, noise_probability
+
+    def _diffusion_compute_loss(self, model, inputs, return_outputs=False):
+        # TrainingArguments in Transformers 5.13 has a use_cache field, but
+        # DiffusionGemma explicitly rejects this argument because its decoder
+        # always uses the encoder KV cache. Never forward it to the model.
+        inputs = dict(inputs)
+        inputs.pop("use_cache", None)
+        inputs.pop("num_items_in_batch", None)
+
+        clean_sequence = inputs.pop("labels", None)
+        if clean_sequence is None:
+            clean_sequence = inputs.get("input_ids")
+        if clean_sequence is None:
+            raise ValueError("DiffusionGemma training requires input_ids or labels.")
+
+        clean_sequence = clean_sequence.long()
+        if clean_sequence.shape[1] != self.block_size:
+            raise ValueError(
+                f"Expected sequence length {self.block_size}, got {clean_sequence.shape[1]}."
+            )
+
+        split_at = self.block_size - self.canvas_length
+        encoder_input_ids = clean_sequence[:, :split_at]
+        clean_canvas = clean_sequence[:, split_at:]
+
+        full_attention_mask = inputs.get("attention_mask")
+        encoder_attention_mask = (
+            full_attention_mask[:, :split_at]
+            if full_attention_mask is not None
+            else None
+        )
+
+        noisy_canvas, corruption_mask, noise_probability = self._build_noisy_canvas(
+            clean_canvas
+        )
+
+        model_kwargs = {
+            "input_ids": encoder_input_ids,
+            "attention_mask": encoder_attention_mask,
+            "decoder_input_ids": noisy_canvas,
+        }
+
+        # Optional two-pass self-conditioning. The first-pass logits are detached
+        # and fed to a second pass; no cache flag is supplied in either pass.
+        use_self_conditioning = (
+            model.training
+            and self.diffusion_self_conditioning_probability > 0.0
+            and torch.rand((), device=clean_sequence.device).item()
+            < self.diffusion_self_conditioning_probability
+        )
+        if use_self_conditioning:
+            with torch.no_grad():
+                first_outputs = model(**model_kwargs)
+            model_kwargs["self_conditioning_logits"] = first_outputs.logits.detach()
+            model_kwargs["self_conditioning_mask"] = torch.ones(
+                clean_sequence.shape[0],
+                dtype=torch.bool,
+                device=clean_sequence.device,
+            )
+
+        outputs = model(**model_kwargs)
+        logits = outputs.logits
+        if logits.shape[:2] != clean_canvas.shape:
+            raise ValueError(
+                "DiffusionGemma logits/canvas shape mismatch: "
+                f"logits={tuple(logits.shape)}, target={tuple(clean_canvas.shape)}"
+            )
+
+        per_token_loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            clean_canvas.reshape(-1),
+            reduction="none",
+        ).view_as(clean_canvas)
+
+        # Inverse-probability weighting makes the random corruption estimator
+        # comparable across sampled noise levels.
+        weights = corruption_mask.float() / noise_probability.clamp_min(1e-4)
+        loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1.0)
+
+        if return_outputs:
+            # Return only what Trainer needs; do not retain the large KV cache.
+            return loss, {"loss": loss.detach(), "logits": logits}
+        return loss
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,
+        **kwargs,
+    ):
+        if self.is_diffusion_gemma:
+            return self._diffusion_compute_loss(
+                model, inputs, return_outputs=return_outputs
+            )
+        return super().compute_loss(
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+            **kwargs,
+        )
+
+    def evaluate(self, *args, **kwargs):
+        if self.is_diffusion_gemma:
+            device = next(self.model.parameters()).device
+            self._eval_noise_generator = torch.Generator(device=device)
+            self._eval_noise_generator.manual_seed(123456789)
+        try:
+            return super().evaluate(*args, **kwargs)
+        finally:
+            self._eval_noise_generator = None
+
     def add_token_accounting(self, logs: dict) -> dict:
         is_eval_log = any(key.startswith("eval_") for key in logs)
 
         logs["global_step"] = int(self.state.global_step)
         logs["train_input_tokens_seen"] = self._train_input_tokens_seen()
         logs["train_loss_tokens_seen"] = self._train_loss_tokens_seen()
-        logs["train_tokens_seen_b"] = round(self._train_input_tokens_seen() / 1_000_000_000, 6)
+        logs["train_tokens_seen_b"] = round(
+            self._train_input_tokens_seen() / 1_000_000_000, 6
+        )
         logs["tokens_per_train_step"] = self.tokens_per_train_step
         logs["loss_tokens_per_train_step"] = self.loss_tokens_per_train_step
         logs["effective_train_batch_size"] = self.effective_train_batch_size
         logs["sequence_length"] = self.block_size
+        if self.is_diffusion_gemma:
+            logs["diffusion_canvas_length"] = self.canvas_length
+            logs["diffusion_context_length"] = self.block_size - self.canvas_length
 
         if is_eval_log and self.eval_samples is not None:
             logs["eval_samples_fixed"] = self.eval_samples
             logs["eval_input_tokens"] = self.eval_tokens
             logs["eval_loss_tokens"] = self.eval_loss_tokens
 
-        # Training logs contain `loss`; eval logs contain `eval_loss`.
-        add_perplexity(logs, "loss", "train_perplexity_from_loss")
-        add_perplexity(logs, "eval_loss", "eval_perplexity")
+        if self.is_diffusion_gemma:
+            add_perplexity(logs, "loss", "train_masked_perplexity")
+            add_perplexity(logs, "eval_loss", "eval_masked_perplexity")
+        else:
+            add_perplexity(logs, "loss", "train_perplexity_from_loss")
+            add_perplexity(logs, "eval_loss", "eval_perplexity")
         return logs
 
     def log(self, logs: dict, *args, **kwargs):
@@ -775,29 +1277,10 @@ def main():
         logger.warning("You are instantiating a new config instance from scratch.")
         if model_args.config_overrides is not None:
             logger.info(f"Overriding config: {model_args.config_overrides}")
-
-            manual_overrides = {}
-            safe_overrides = []
-
-            for item in model_args.config_overrides.split(","):
-                key, value = item.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-
-                if key == "n_inner":
-                    manual_overrides[key] = int(value)
-                else:
-                    safe_overrides.append(f"{key}={value}")
-
-            if safe_overrides:
-                config.update_from_string(",".join(safe_overrides))
-
-            for key, value in manual_overrides.items():
-                setattr(config, key, value)
-
+            apply_config_overrides(config, model_args.config_overrides)
             logger.info(f"New config: {config}")
 
-    normalize_gemma4_text_config(config)
+    normalize_gemma4_config(config)
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -821,44 +1304,52 @@ def main():
     # which can leave extra undecodable tokens when len(tokenizer) is smaller than
     # the default GPT-2 vocab size.
     if model_args.model_name_or_path is None:
-        config.vocab_size = len(tokenizer)
-        if tokenizer.bos_token_id is not None:
-            config.bos_token_id = tokenizer.bos_token_id
-        if tokenizer.eos_token_id is not None:
-            config.eos_token_id = tokenizer.eos_token_id
-        if tokenizer.pad_token_id is not None:
-            config.pad_token_id = tokenizer.pad_token_id
+        sync_tokenizer_ids_to_config(config, tokenizer, block_size=data_args.block_size)
         if data_args.block_size is not None and tokenizer.model_max_length < data_args.block_size:
             logger.warning(
                 f"Tokenizer model_max_length={tokenizer.model_max_length} is smaller than "
                 f"requested block_size={data_args.block_size}; overriding tokenizer.model_max_length "
-                "for this scratch GPT-2 baseline."
+                "for this scratch baseline."
             )
             tokenizer.model_max_length = data_args.block_size
-        logger.info(f"Scratch config vocab_size set to tokenizer length: {config.vocab_size}")
+        logger.info(
+            "Scratch config vocab_size set to tokenizer length. "
+            f"top_level={getattr(config, 'vocab_size', None)}, "
+            f"text_config={getattr(getattr(config, 'text_config', None), 'vocab_size', None)}"
+        )
 
     if model_args.model_name_or_path:
         dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
-            dtype=dtype,
-        )
+        model = load_model_from_pretrained(model_args, config, dtype)
     else:
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+        model = build_model_from_config(config, model_args)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
-        logger.info(f"Training new model from scratch - Total size={n_params / 2**20:.2f}M params")
+        logger.info(f"Training new model from scratch - Total size={n_params / 1_000_000:.2f}M params")
 
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+
+    if is_diffusion_gemma_config(config):
+        # DiffusionGemma always uses its encoder KV cache and rejects an explicit
+        # use_cache argument. It is also currently incompatible with Inductor's
+        # grouped-MoE fallback in Transformers/PyTorch, so keep this run eager.
+        training_args.use_cache = None
+        training_args.prediction_loss_only = True
+        if training_args.torch_compile:
+            logger.warning(
+                "Disabling torch_compile for DiffusionGemma: grouped_mm MoE fallback "
+                "causes repeated Inductor graph breaks in Transformers 5.13.1."
+            )
+            training_args.torch_compile = False
+        if training_args.remove_unused_columns:
+            logger.warning(
+                "Setting remove_unused_columns=False so the clean labels remain "
+                "available to the custom DiffusionGemma loss."
+            )
+            training_args.remove_unused_columns = False
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
@@ -995,22 +1486,25 @@ def main():
         elif not data_args.streaming:
             eval_samples_for_accounting = len(eval_dataset)
 
-        def preprocess_logits_for_metrics(logits, labels):
-            if isinstance(logits, tuple):
-                # Depending on the model and config, logits may contain extra tensors,
-                # like past_key_values, but logits always come first
-                logits = logits[0]
-            return logits.argmax(dim=-1)
+        if not is_diffusion_gemma_config(config):
+            def preprocess_logits_for_metrics(logits, labels):
+                if isinstance(logits, tuple):
+                    logits = logits[0]
+                return logits.argmax(dim=-1)
 
-        metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
+            metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
 
-        def compute_metrics(eval_preds):
-            preds, labels = eval_preds
-            # preds have the same shape as the labels, after the argmax(-1) has been calculated
-            # by preprocess_logits_for_metrics but we need to shift the labels
-            labels = labels[:, 1:].reshape(-1)
-            preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+            def compute_metrics(eval_preds):
+                preds, labels = eval_preds
+                labels = labels[:, 1:].reshape(-1)
+                preds = preds[:, :-1].reshape(-1)
+                return metric.compute(predictions=preds, references=labels)
+        else:
+            # Diffusion logits cover only the canvas, while labels contain the
+            # full context+canvas sequence. The custom Trainer reports stable
+            # masked denoising loss/perplexity directly.
+            preprocess_logits_for_metrics = None
+            compute_metrics = None
 
     # Initialize our Trainer
     trainer = TokenAccountingTrainer(
@@ -1026,6 +1520,9 @@ def main():
         else None,
         block_size=block_size,
         eval_samples=eval_samples_for_accounting,
+        diffusion_min_noise=data_args.diffusion_min_noise,
+        diffusion_max_noise=data_args.diffusion_max_noise,
+        diffusion_self_conditioning_probability=data_args.diffusion_self_conditioning_probability,
     )
 
     logger.info(
@@ -1068,7 +1565,10 @@ def main():
         metrics["loss_tokens_per_train_step"] = trainer.loss_tokens_per_train_step
         metrics["effective_train_batch_size"] = trainer.effective_train_batch_size
         metrics["sequence_length"] = block_size
-        add_perplexity(metrics, "train_loss", "train_perplexity")
+        if trainer.is_diffusion_gemma:
+            add_perplexity(metrics, "train_loss", "train_masked_perplexity")
+        else:
+            add_perplexity(metrics, "train_loss", "train_perplexity")
 
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
@@ -1089,12 +1589,17 @@ def main():
             metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
 
         metrics["eval_input_tokens"] = metrics["eval_samples"] * block_size
-        metrics["eval_loss_tokens"] = metrics["eval_samples"] * max(1, block_size - 1)
+        metrics["eval_loss_tokens"] = (
+            metrics["eval_samples"] * trainer.target_tokens_per_sequence
+        )
         metrics["train_input_tokens_seen"] = trainer._train_input_tokens_seen()
         metrics["train_loss_tokens_seen"] = trainer._train_loss_tokens_seen()
         metrics["train_tokens_seen_b"] = round(trainer._train_input_tokens_seen() / 1_000_000_000, 6)
-        add_perplexity(metrics, "eval_loss", "perplexity")
-        metrics["eval_perplexity"] = metrics["perplexity"]
+        if trainer.is_diffusion_gemma:
+            add_perplexity(metrics, "eval_loss", "eval_masked_perplexity")
+        else:
+            add_perplexity(metrics, "eval_loss", "perplexity")
+            metrics["eval_perplexity"] = metrics["perplexity"]
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)

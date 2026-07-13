@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fine-tune TRLM, GPT-2, or Gemma4-Text on GSM8K + SVAMP and evaluate on their test splits.
+Fine-tune TRLM, GPT-2, Gemma4-Text, or DiffusionGemma on GSM8K + SVAMP and evaluate on their test splits.
 
 TRLM mode:
     Prompt tokens stay visible.
@@ -14,7 +14,13 @@ GPT-2 / Gemma4-Text mode:
     Prompt labels are -100, answer labels are visible for causal LM training.
     Evaluation generates the answer from the prompt with greedy decoding.
 
-This lets you compare TRLM, GPT-2, and Gemma4-Text on the same tokenizer,
+DiffusionGemma mode:
+    Prompt tokens are encoded causally as context.
+    Answer tokens occupy the beginning of a fixed-size diffusion canvas.
+    Random answer positions are corrupted and reconstructed bidirectionally.
+    Evaluation uses DiffusionGemma's iterative block-denoising generate().
+
+This lets you compare TRLM, GPT-2, Gemma4-Text, and DiffusionGemma on the same tokenizer,
 same prompts, same target formatting, same splits, and same numeric exact-match metric.
 """
 
@@ -33,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict, load_dataset
 from huggingface_hub import login
@@ -145,6 +152,14 @@ def numeric_equal(pred: Optional[float], gold: Optional[float], tol: float = 1e-
 
 def is_causal_lm_type(model_type: str) -> bool:
     return model_type in {"gpt2", "gemma4_text"}
+
+
+def is_diffusion_lm_type(model_type: str) -> bool:
+    return model_type == "diffusion_gemma"
+
+
+def is_hf_pretrained_model_type(model_type: str) -> bool:
+    return is_causal_lm_type(model_type) or is_diffusion_lm_type(model_type)
 
 
 # -----------------------------------------------------------------------------
@@ -263,33 +278,83 @@ class MathCollator:
         max_seq_len: int = 1024,
         max_answer_tokens: int = 384,
         pad_to_max_seq_len: bool = False,
+        diffusion_canvas_length: int = 256,
     ) -> None:
         self.tokenizer = tokenizer
         self.model_type = model_type
-        self.max_seq_len = max_seq_len
-        self.max_answer_tokens = max_answer_tokens
-        self.pad_to_max_seq_len = pad_to_max_seq_len
+        self.max_seq_len = int(max_seq_len)
+        self.max_answer_tokens = int(max_answer_tokens)
+        self.pad_to_max_seq_len = bool(pad_to_max_seq_len)
+        self.diffusion_canvas_length = int(diffusion_canvas_length)
 
         if model_type == "trlm" and tokenizer.mask_token_id is None:
             raise ValueError("TRLM mode requires tokenizer.mask_token_id.")
         if tokenizer.pad_token_id is None:
             raise ValueError("Tokenizer must have a pad_token_id.")
 
+        if is_diffusion_lm_type(model_type):
+            if not 0 < self.diffusion_canvas_length < self.max_seq_len:
+                raise ValueError(
+                    "DiffusionGemma requires 0 < canvas_length < max_seq_len, got "
+                    f"canvas_length={self.diffusion_canvas_length}, max_seq_len={self.max_seq_len}."
+                )
+            if self.max_answer_tokens > self.diffusion_canvas_length:
+                print(
+                    f"[WARN] max_answer_tokens={self.max_answer_tokens} exceeds DiffusionGemma "
+                    f"canvas_length={self.diffusion_canvas_length}; answers will be capped to the canvas."
+                )
+
     def _encode(self, text: str) -> List[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
+    def _encode_answer(self, text: str, hard_limit: int) -> List[int]:
+        answer_ids = self._encode(text)
+        if self.tokenizer.eos_token_id is not None:
+            answer_ids = answer_ids + [self.tokenizer.eos_token_id]
+
+        answer_limit = min(self.max_answer_tokens, hard_limit)
+        if len(answer_ids) > answer_limit:
+            # Preserve the final answer marker and EOS when a reasoning trace is too long.
+            answer_ids = answer_ids[-answer_limit:]
+        return answer_ids
+
     def __call__(self, features: List[Dict[str, str]]) -> Dict[str, Any]:
-        encoded_rows = []
+        encoded_rows: List[Dict[str, Any]] = []
 
         for ex in features:
             prompt_ids = self._encode(ex["prompt"])
-            answer_ids = self._encode(ex["target"])
-            if self.tokenizer.eos_token_id is not None:
-                answer_ids = answer_ids + [self.tokenizer.eos_token_id]
 
-            if len(answer_ids) > self.max_answer_tokens:
-                answer_ids = answer_ids[-self.max_answer_tokens:]
+            if is_diffusion_lm_type(self.model_type):
+                canvas_length = self.diffusion_canvas_length
+                answer_ids = self._encode_answer(ex["target"], canvas_length)
+                max_context_len = self.max_seq_len - canvas_length
+                if max_context_len < 8:
+                    raise ValueError(
+                        f"max_seq_len={self.max_seq_len} leaves fewer than 8 prompt tokens "
+                        f"after reserving canvas_length={canvas_length}."
+                    )
+                if len(prompt_ids) > max_context_len:
+                    prompt_ids = prompt_ids[-max_context_len:]
 
+                answer_len = len(answer_ids)
+                clean_canvas = answer_ids + [self.tokenizer.pad_token_id] * (canvas_length - answer_len)
+                canvas_labels = answer_ids + [-100] * (canvas_length - answer_len)
+
+                encoded_rows.append({
+                    "input_ids": prompt_ids,
+                    "labels": canvas_labels,
+                    "clean_canvas": clean_canvas,
+                    "attention_mask": [1] * len(prompt_ids),
+                    "prompt_len": len(prompt_ids),
+                    "answer_len": answer_len,
+                    "source": ex["source"],
+                    "gold_final": ex["gold_final"],
+                    "question": ex["question"],
+                    "target_text": ex["target"],
+                })
+                continue
+
+            answer_ids = self._encode_answer(ex["target"], self.max_seq_len)
             min_prompt_tokens = 8
             available_prompt_len = self.max_seq_len - len(answer_ids)
             if available_prompt_len < min_prompt_tokens:
@@ -321,6 +386,42 @@ class MathCollator:
                 "target_text": ex["target"],
             })
 
+        if is_diffusion_lm_type(self.model_type):
+            if self.pad_to_max_seq_len:
+                context_batch_len = self.max_seq_len - self.diffusion_canvas_length
+            else:
+                context_batch_len = max(len(row["input_ids"]) for row in encoded_rows)
+
+            input_batch, mask_batch = [], []
+            for row in encoded_rows:
+                # Left padding keeps the final real prompt token adjacent to the canvas.
+                pad_len = context_batch_len - len(row["input_ids"])
+                if pad_len < 0:
+                    row["input_ids"] = row["input_ids"][-context_batch_len:]
+                    row["attention_mask"] = row["attention_mask"][-context_batch_len:]
+                    row["prompt_len"] = context_batch_len
+                    pad_len = 0
+
+                input_batch.append(
+                    [self.tokenizer.pad_token_id] * pad_len + row["input_ids"]
+                )
+                mask_batch.append([0] * pad_len + row["attention_mask"])
+
+            input_tensor = torch.tensor(input_batch, dtype=torch.long)
+            return {
+                "input_ids": input_tensor,
+                "masked_input_ids": input_tensor,
+                "labels": torch.tensor([r["labels"] for r in encoded_rows], dtype=torch.long),
+                "clean_canvas": torch.tensor([r["clean_canvas"] for r in encoded_rows], dtype=torch.long),
+                "attention_mask": torch.tensor(mask_batch, dtype=torch.long),
+                "prompt_lens": torch.tensor([r["prompt_len"] for r in encoded_rows], dtype=torch.long),
+                "answer_lens": torch.tensor([r["answer_len"] for r in encoded_rows], dtype=torch.long),
+                "sources": [r["source"] for r in encoded_rows],
+                "gold_finals": [r["gold_final"] for r in encoded_rows],
+                "questions": [r["question"] for r in encoded_rows],
+                "target_texts": [r["target_text"] for r in encoded_rows],
+            }
+
         if self.pad_to_max_seq_len:
             batch_len = self.max_seq_len
         else:
@@ -340,10 +441,8 @@ class MathCollator:
             mask_batch.append(row["attention_mask"] + [0] * pad_len)
 
         input_tensor = torch.tensor(input_batch, dtype=torch.long)
-
         return {
             "input_ids": input_tensor,
-            # Alias kept so old TRLM-specific code still works if needed.
             "masked_input_ids": input_tensor,
             "labels": torch.tensor(label_batch, dtype=torch.long),
             "attention_mask": torch.tensor(mask_batch, dtype=torch.long),
@@ -435,29 +534,36 @@ def resolve_model_type(args) -> str:
         return args.model_type
 
     ckpt_path = Path(args.checkpoint_path)
+    config_path = ckpt_path / "config.json" if ckpt_path.is_dir() else ckpt_path.parent / "config.json"
+
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                model_type = str(json.load(f).get("model_type", "")).lower()
+            if model_type == "diffusion_gemma" or "diffusion_gemma" in model_type:
+                return "diffusion_gemma"
+            if "gemma" in model_type:
+                return "gemma4_text"
+            if "gpt2" in model_type or "gpt" in model_type:
+                return "gpt2"
+        except Exception:
+            pass
+
     if ckpt_path.suffix.lower() == ".safetensors":
-        config_path = ckpt_path.parent / "config.json"
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    model_type = str(json.load(f).get("model_type", "")).lower()
-                if "gemma" in model_type:
-                    return "gemma4_text"
-                if "gpt2" in model_type or "gpt" in model_type:
-                    return "gpt2"
-            except Exception:
-                pass
         # Backward-compatible default for old GPT-2 safetensors checkpoints.
         return "gpt2"
-
     return "trlm"
 
 
 def load_tokenizer(args):
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
-    if tokenizer.mask_token is None:
+    # Do not silently grow the vocabulary for HF checkpoints. DiffusionGemma and
+    # causal baselines must use exactly the tokenizer vocabulary used in pretraining.
+    if args.model_type_resolved == "trlm" and tokenizer.mask_token is None:
         tokenizer.add_special_tokens({"mask_token": "[MASK]"})
     if tokenizer.pad_token is None:
+        if tokenizer.eos_token is None:
+            raise ValueError("Tokenizer must define either pad_token or eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
 
@@ -836,6 +942,188 @@ def load_gemma4_text_model(args, tokenizer):
     return model
 
 
+
+def patch_diffusion_gemma_text_only_encoder() -> None:
+    """Allow Transformers 5.13.x DiffusionGemma to load a text-only checkpoint."""
+    try:
+        from transformers.models.diffusion_gemma import modeling_diffusion_gemma as dg_modeling
+    except ImportError as exc:
+        raise ImportError(
+            "DiffusionGemma requires a Transformers build with DiffusionGemma support "
+            "(transformers>=5.11.0)."
+        ) from exc
+
+    encoder_cls = dg_modeling.DiffusionGemmaEncoderModel
+    if getattr(encoder_cls, "_trlm_text_only_constructor_patch", False):
+        return
+
+    def text_only_encoder_init(self, config):
+        dg_modeling.DiffusionGemmaPreTrainedModel.__init__(self, config)
+        self.vocab_size = config.text_config.vocab_size
+        self.language_model = dg_modeling.DiffusionGemmaEncoderTextModel(config=config.text_config)
+        self.vision_tower = None
+        self.embed_vision = None
+        self.post_init()
+
+    encoder_cls.__init__ = text_only_encoder_init
+    encoder_cls._trlm_text_only_constructor_patch = True
+
+
+def patch_diffusion_gemma_generation_config_compat() -> None:
+    """
+    Make older/transition Transformers DiffusionGemma builds tolerate
+    ``return_dict_in_generate`` in generation_config.json.
+
+    Some DiffusionGemmaGenerationConfig revisions inherit the generic
+    GenerationConfig serialization output but reject this otherwise harmless
+    key in their custom ``__init__``.  ``from_pretrained`` loads weights first
+    and then crashes while reading generation_config.json.  Swallowing only
+    this compatibility key is safe because DiffusionGemma generation already
+    defaults to returning its structured generation output.
+    """
+    try:
+        from transformers.models.diffusion_gemma import generation_diffusion_gemma as dg_generation
+    except ImportError as exc:
+        raise ImportError(
+            "Could not import DiffusionGemma generation utilities. "
+            "Install a Transformers build with DiffusionGemma support."
+        ) from exc
+
+    generation_config_cls = dg_generation.DiffusionGemmaGenerationConfig
+    if getattr(generation_config_cls, "_trlm_return_dict_compat_patch", False):
+        return
+
+    # Newer releases already accept this field. Test before monkey-patching so
+    # we leave those versions untouched.
+    try:
+        generation_config_cls(return_dict_in_generate=True)
+    except ValueError as exc:
+        if "return_dict_in_generate" not in str(exc):
+            raise
+    else:
+        generation_config_cls._trlm_return_dict_compat_patch = True
+        return
+
+    original_init = generation_config_cls.__init__
+
+    def compatible_init(self, **kwargs):
+        # Do not re-attach the attribute on old implementations. Their
+        # generation code uses getattr(..., True), and omitting it also prevents
+        # save_pretrained() from writing the incompatible key again.
+        kwargs.pop("return_dict_in_generate", None)
+        original_init(self, **kwargs)
+
+    generation_config_cls.__init__ = compatible_init
+    generation_config_cls._trlm_return_dict_compat_patch = True
+    print(
+        "[INFO] Applied DiffusionGemma generation-config compatibility patch "
+        "for return_dict_in_generate."
+    )
+
+
+def _set_diffusion_tokenizer_ids(config, tokenizer) -> None:
+    text_config = getattr(config, "text_config", config)
+    text_config.vocab_size = len(tokenizer)
+    text_config.pad_token_id = tokenizer.pad_token_id
+    text_config.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        text_config.bos_token_id = tokenizer.bos_token_id
+    if hasattr(config, "pad_token_id"):
+        config.pad_token_id = tokenizer.pad_token_id
+    if hasattr(config, "eos_token_id"):
+        config.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None and hasattr(config, "bos_token_id"):
+        config.bos_token_id = tokenizer.bos_token_id
+
+
+def load_diffusion_gemma_model(args, tokenizer):
+    try:
+        from transformers import DiffusionGemmaForBlockDiffusion
+    except ImportError as exc:
+        raise ImportError(
+            "Could not import DiffusionGemmaForBlockDiffusion. Install transformers>=5.11.0."
+        ) from exc
+
+    ckpt_path = Path(args.checkpoint_path)
+    checkpoint_dir = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
+    config_source = args.diffusion_config_path or str(checkpoint_dir)
+    config = AutoConfig.from_pretrained(
+        config_source,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if getattr(config, "model_type", None) != "diffusion_gemma":
+        raise ValueError(
+            f"Expected a diffusion_gemma config, got model_type={getattr(config, 'model_type', None)!r}."
+        )
+
+    config.vision_config = None
+    patch_diffusion_gemma_text_only_encoder()
+    patch_diffusion_gemma_generation_config_compat()
+
+    text_config = getattr(config, "text_config", config)
+    checkpoint_vocab = int(getattr(text_config, "vocab_size"))
+    if checkpoint_vocab != len(tokenizer) and not args.allow_resize_token_embeddings:
+        raise ValueError(
+            f"DiffusionGemma vocab mismatch: checkpoint vocab_size={checkpoint_vocab}, "
+            f"len(tokenizer)={len(tokenizer)}. Use the pretraining tokenizer or pass "
+            "--allow_resize_token_embeddings."
+        )
+
+    # A Trainer checkpoint directory and a model.safetensors file next to
+    # config.json are both loaded through the standard HF directory loader.
+    has_hf_weights = any(
+        (checkpoint_dir / name).exists()
+        for name in (
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        )
+    )
+
+    if has_hf_weights:
+        model = DiffusionGemmaForBlockDiffusion.from_pretrained(
+            str(checkpoint_dir),
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        state, _ = load_checkpoint_dict(args.checkpoint_path)
+        state = strip_wrapper_prefixes(state)
+        model = DiffusionGemmaForBlockDiffusion(config)
+        state = align_state_dict_keys_to_model(state, model)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        serious_missing = [k for k in missing if not k.endswith("rotary_emb.inv_freq")]
+        print(f"DiffusionGemma missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
+        if serious_missing:
+            print(f"First missing keys: {serious_missing[:10]}")
+        if unexpected:
+            print(f"First unexpected keys: {unexpected[:10]}")
+        if len(serious_missing) > 10 or len(unexpected) > 10:
+            raise RuntimeError("DiffusionGemma checkpoint did not load cleanly.")
+
+    if checkpoint_vocab != len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+        _set_diffusion_tokenizer_ids(model.config, tokenizer)
+    else:
+        _set_diffusion_tokenizer_ids(model.config, tokenizer)
+
+    canvas_length = int(getattr(model.config, "canvas_length", args.diffusion_canvas_length))
+    args.diffusion_canvas_length = canvas_length
+    text_config = getattr(model.config, "text_config", model.config)
+    n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
+    print(f"Loaded DiffusionGemma checkpoint: {checkpoint_dir}")
+    print(
+        "DiffusionGemma config: "
+        f"layers={getattr(text_config, 'num_hidden_layers', 'NA')}, "
+        f"hidden={getattr(text_config, 'hidden_size', 'NA')}, "
+        f"heads={getattr(text_config, 'num_attention_heads', 'NA')}, "
+        f"kv_heads={getattr(text_config, 'num_key_value_heads', 'NA')}, "
+        f"intermediate={getattr(text_config, 'intermediate_size', 'NA')}, "
+        f"canvas_length={canvas_length}, params={n_params / 1_000_000:.2f}M"
+    )
+    return model
+
 def load_model(args, tokenizer):
     if args.model_type_resolved == "trlm":
         return load_trlm_model(args, tokenizer)
@@ -843,6 +1131,8 @@ def load_model(args, tokenizer):
         return load_gpt2_model(args, tokenizer)
     if args.model_type_resolved == "gemma4_text":
         return load_gemma4_text_model(args, tokenizer)
+    if args.model_type_resolved == "diffusion_gemma":
+        return load_diffusion_gemma_model(args, tokenizer)
     raise ValueError(f"Unsupported model_type: {args.model_type_resolved}")
 
 
@@ -860,7 +1150,7 @@ def save_checkpoint(
     out = Path(output_dir) / name
     out.mkdir(parents=True, exist_ok=True)
 
-    if is_causal_lm_type(args.model_type_resolved):
+    if is_hf_pretrained_model_type(args.model_type_resolved):
         model.save_pretrained(out, safe_serialization=True)
         tokenizer.save_pretrained(out)
         train_state = {
@@ -907,7 +1197,140 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
     return out
 
 
-def forward_loss(model, batch: Dict[str, Any], args) -> Tuple[torch.Tensor, Dict[str, float]]:
+def _diffusion_rand(
+    shape,
+    *,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    return torch.rand(shape, device=device, dtype=torch.float32, generator=generator)
+
+
+def diffusion_gemma_loss(
+    model,
+    batch: Dict[str, Any],
+    args,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    clean_canvas = batch["clean_canvas"].long()
+    labels = batch["labels"].long()
+    target_mask = labels.ne(-100)
+    if not target_mask.any():
+        raise ValueError("DiffusionGemma batch contains no supervised answer tokens.")
+
+    batch_size, canvas_length = clean_canvas.shape
+    if canvas_length != int(args.diffusion_canvas_length):
+        raise ValueError(
+            f"Canvas mismatch: batch={canvas_length}, config={args.diffusion_canvas_length}."
+        )
+
+    if model.training:
+        noise_probability = _diffusion_rand(
+            (batch_size, 1), device=clean_canvas.device, generator=generator
+        )
+        noise_probability = (
+            args.diffusion_min_noise
+            + noise_probability * (args.diffusion_max_noise - args.diffusion_min_noise)
+        )
+    else:
+        noise_probability = torch.full(
+            (batch_size, 1),
+            float(args.diffusion_eval_noise),
+            device=clean_canvas.device,
+            dtype=torch.float32,
+        )
+
+    corruption_mask = (
+        _diffusion_rand(
+            clean_canvas.shape,
+            device=clean_canvas.device,
+            generator=generator,
+        ) < noise_probability
+    ) & target_mask
+
+    # Guarantee at least one corrupted target per sequence.
+    empty_rows = target_mask.any(dim=1) & ~corruption_mask.any(dim=1)
+    if empty_rows.any():
+        first_target = target_mask.to(torch.int64).argmax(dim=1)
+        row_ids = empty_rows.nonzero(as_tuple=False).squeeze(1)
+        corruption_mask[row_ids, first_target[row_ids]] = True
+
+    text_config = getattr(model.config, "text_config", model.config)
+    vocab_size = int(text_config.vocab_size)
+    random_tokens = torch.randint(
+        0,
+        vocab_size,
+        clean_canvas.shape,
+        device=clean_canvas.device,
+        generator=generator,
+    )
+    # Generation starts from a random full canvas. Keep unsupervised positions
+    # random during SFT as well, so the answer cannot rely on a clean PAD tail.
+    noisy_canvas = torch.where(target_mask, clean_canvas, random_tokens)
+    noisy_canvas = torch.where(corruption_mask, random_tokens, noisy_canvas)
+
+    encoder_attention_mask = batch["attention_mask"]
+    decoder_attention_mask = torch.cat(
+        [encoder_attention_mask, torch.ones_like(clean_canvas)], dim=1
+    )
+    model_kwargs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": encoder_attention_mask,
+        "decoder_input_ids": noisy_canvas,
+        "decoder_attention_mask": decoder_attention_mask,
+    }
+
+    if model.training and args.diffusion_self_conditioning_probability > 0.0:
+        sc_mask = _diffusion_rand(
+            (batch_size,), device=clean_canvas.device, generator=generator
+        ) < args.diffusion_self_conditioning_probability
+        if sc_mask.any():
+            with torch.no_grad():
+                first_outputs = model(**model_kwargs)
+            model_kwargs["self_conditioning_logits"] = first_outputs.logits.detach()
+            model_kwargs["self_conditioning_mask"] = sc_mask
+
+    outputs = model(**model_kwargs)
+    logits = outputs.logits
+    if logits.shape[:2] != clean_canvas.shape:
+        raise ValueError(
+            f"DiffusionGemma logits shape {tuple(logits.shape)} does not match "
+            f"canvas {tuple(clean_canvas.shape)}."
+        )
+
+    safe_targets = labels.masked_fill(~target_mask, 0)
+    per_token_loss = F.cross_entropy(
+        logits.float().reshape(-1, logits.shape[-1]),
+        safe_targets.reshape(-1),
+        reduction="none",
+    ).view_as(clean_canvas)
+
+    weights = corruption_mask.float() / noise_probability.clamp_min(1e-4)
+    loss = (per_token_loss * weights).sum() / weights.sum().clamp_min(1.0)
+
+    with torch.no_grad():
+        predictions = logits.argmax(dim=-1)
+        masked_correct = ((predictions == safe_targets) & corruption_mask).sum()
+        masked_total = corruption_mask.sum().clamp_min(1)
+        masked_accuracy = masked_correct.float() / masked_total.float()
+        mean_noise = noise_probability.mean()
+
+    return loss, {
+        "lm_loss": float(loss.detach().item()),
+        "short_lm": 0.0,
+        "consistency": 0.0,
+        "depth": float(args.diffusion_gen_steps),
+        "masked_accuracy": float(masked_accuracy.item()),
+        "noise_probability": float(mean_noise.item()),
+    }
+
+
+def forward_loss(
+    model,
+    batch: Dict[str, Any],
+    args,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     if args.model_type_resolved == "trlm":
         if args.use_short_consistency:
             long_steps = make_steps(args.recursion_steps)
@@ -929,6 +1352,9 @@ def forward_loss(model, batch: Dict[str, Any], args) -> Tuple[torch.Tensor, Dict
             "consistency": float(consistency_loss.item()) if torch.is_tensor(consistency_loss) else 0.0,
             "depth": float(depth),
         }
+
+    if is_diffusion_lm_type(args.model_type_resolved):
+        return diffusion_gemma_loss(model, batch, args, generator=generator)
 
     outputs = model(
         input_ids=batch["input_ids"],
@@ -956,6 +1382,47 @@ def generate_trlm(model: TRLM, batch: Dict[str, Any], tokenizer, args) -> torch.
         remask_ratio_end=0.0,
         forbid_mask_token=True,
     )
+
+
+@torch.no_grad()
+def generate_diffusion_gemma(model, batch: Dict[str, Any], tokenizer, args) -> torch.Tensor:
+    try:
+        from transformers import DiffusionGemmaGenerationConfig, EntropyBoundSamplerConfig
+    except ImportError as exc:
+        raise ImportError(
+            "DiffusionGemma generation requires transformers>=5.11.0."
+        ) from exc
+
+    answer_lens = batch["answer_lens"].detach().cpu().tolist()
+    if args.diffusion_max_new_tokens > 0:
+        max_new_tokens = args.diffusion_max_new_tokens
+    elif args.diffusion_decode_gold_length:
+        max_new_tokens = max(answer_lens) + args.diffusion_extra_new_tokens
+    else:
+        max_new_tokens = int(args.diffusion_canvas_length)
+    max_new_tokens = max(1, int(max_new_tokens))
+
+    generation_config = DiffusionGemmaGenerationConfig(
+        max_new_tokens=max_new_tokens,
+        max_denoising_steps=args.diffusion_gen_steps,
+        sampler_config=EntropyBoundSamplerConfig(
+            entropy_bound=args.diffusion_entropy_bound
+        ),
+        t_min=args.diffusion_t_min,
+        t_max=args.diffusion_t_max,
+        stability_threshold=args.diffusion_stability_threshold,
+        confidence_threshold=args.diffusion_confidence_threshold,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+
+    generated = model.generate(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        generation_config=generation_config,
+    )
+    return generated.sequences if hasattr(generated, "sequences") else generated
 
 
 @torch.no_grad()
@@ -1027,6 +1494,11 @@ def evaluate_generation(
     autocast_dtype = get_autocast_dtype(args.mixed_precision)
     use_autocast = autocast_dtype is not None and device.type == "cuda"
 
+    diffusion_loss_generator = None
+    if is_diffusion_lm_type(args.model_type_resolved):
+        diffusion_loss_generator = torch.Generator(device=device)
+        diffusion_loss_generator.manual_seed(args.diffusion_eval_seed)
+
     pbar = tqdm(loader, desc=f"eval:{name}", leave=False)
     for batch_idx, batch in enumerate(pbar):
         if max_batches is not None and batch_idx >= max_batches:
@@ -1035,12 +1507,34 @@ def evaluate_generation(
         batch = move_batch_to_device(batch, device)
 
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
-            loss, _ = forward_loss(model, batch, args)
+            loss, _ = forward_loss(
+                model,
+                batch,
+                args,
+                generator=diffusion_loss_generator,
+            )
         total_loss += float(loss.item())
         loss_batches += 1
 
         if args.model_type_resolved == "trlm":
             generated = generate_trlm(model, batch, tokenizer, args).detach().cpu()
+        elif is_diffusion_lm_type(args.model_type_resolved):
+            # Make stochastic diffusion evaluation repeatable without changing
+            # the RNG stream used by the surrounding training loop.
+            cpu_rng_state = torch.random.get_rng_state()
+            cuda_rng_state = None
+            if device.type == "cuda":
+                cuda_rng_state = torch.cuda.get_rng_state(device)
+            eval_seed = int(args.diffusion_eval_seed) + int(batch_idx)
+            torch.manual_seed(eval_seed)
+            if device.type == "cuda":
+                torch.cuda.manual_seed(eval_seed)
+            try:
+                generated = generate_diffusion_gemma(model, batch, tokenizer, args).detach().cpu()
+            finally:
+                torch.random.set_rng_state(cpu_rng_state)
+                if cuda_rng_state is not None:
+                    torch.cuda.set_rng_state(cuda_rng_state, device)
         else:
             generated = generate_causal_lm(model, batch, tokenizer, args, device).detach().cpu()
 
@@ -1054,6 +1548,14 @@ def evaluate_generation(
             if args.model_type_resolved == "trlm":
                 start = prompt_lens[i]
                 end = start + answer_lens[i]
+                pred_ids = generated[i, start:end]
+            elif is_diffusion_lm_type(args.model_type_resolved):
+                # DiffusionGemma generation returns left-padded prompt + denoised continuation.
+                start = batch["input_ids"].shape[1]
+                if args.diffusion_decode_gold_length:
+                    end = start + answer_lens[i]
+                else:
+                    end = generated.size(1)
                 pred_ids = generated[i, start:end]
             else:
                 # generated contains left-padded prompt + continuation.
@@ -1108,6 +1610,13 @@ def train(args) -> None:
     args.model_type_resolved = resolve_model_type(args)
     print(f"Resolved model_type: {args.model_type_resolved}")
 
+    if not 0.0 < args.diffusion_min_noise <= args.diffusion_max_noise <= 1.0:
+        raise ValueError("Expected 0 < diffusion_min_noise <= diffusion_max_noise <= 1.")
+    if not 0.0 < args.diffusion_eval_noise <= 1.0:
+        raise ValueError("diffusion_eval_noise must be in (0, 1].")
+    if not 0.0 <= args.diffusion_self_conditioning_probability <= 1.0:
+        raise ValueError("diffusion_self_conditioning_probability must be in [0, 1].")
+
     token = os.environ.get(args.hf_token_env, None)
     if token:
         login(token=token)
@@ -1115,12 +1624,25 @@ def train(args) -> None:
     tokenizer = load_tokenizer(args)
     train_ds, val_ds, gsm_test_ds, svamp_test_ds = build_datasets(args)
 
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    model = load_model(args, tokenizer).to(device)
+
+    if is_diffusion_lm_type(args.model_type_resolved):
+        model_canvas_length = int(getattr(model.config, "canvas_length", args.diffusion_canvas_length))
+        if args.diffusion_canvas_length != model_canvas_length:
+            print(
+                f"[INFO] Using checkpoint canvas_length={model_canvas_length} instead of "
+                f"CLI value {args.diffusion_canvas_length}."
+            )
+        args.diffusion_canvas_length = model_canvas_length
+
     collator = MathCollator(
         tokenizer=tokenizer,
         model_type=args.model_type_resolved,
         max_seq_len=args.max_seq_len,
         max_answer_tokens=args.max_answer_tokens,
         pad_to_max_seq_len=args.pad_to_max_seq_len,
+        diffusion_canvas_length=args.diffusion_canvas_length,
     )
 
     train_loader = DataLoader(
@@ -1161,9 +1683,6 @@ def train(args) -> None:
     print(f"Val examples:   {len(val_ds)}")
     print(f"GSM8K test:     {len(gsm_test_ds)}")
     print(f"SVAMP test:     {len(svamp_test_ds)}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    model = load_model(args, tokenizer).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -1220,7 +1739,10 @@ def train(args) -> None:
                         f"loss={avg_loss:.4f} lm_loss={extra['lm_loss']:.4f} "
                         f"short_lm={extra['short_lm']:.4f} "
                         f"cons={extra['consistency']:.4f} "
-                        f"depth={extra['depth']} grad={float(grad_norm):.4f} lr={lr:.2e}"
+                        f"depth={extra['depth']} "
+                        f"masked_acc={extra.get('masked_accuracy', 0.0):.4f} "
+                        f"noise={extra.get('noise_probability', 0.0):.3f} "
+                        f"grad={float(grad_norm):.4f} lr={lr:.2e}"
                     )
                     running_loss = 0.0
 
@@ -1237,6 +1759,8 @@ def train(args) -> None:
                         max_batches=max_eval_batches,
                     )
                     pbar.write(f"VAL: {val_metrics}")
+                    # evaluate_generation() switches the module to eval mode.
+                    model.train()
 
                     if val_metrics["accuracy"] > best_val_acc:
                         best_val_acc = val_metrics["accuracy"]
@@ -1325,10 +1849,10 @@ def train(args) -> None:
 # -----------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune TRLM, GPT-2, or Gemma4-Text on GSM8K + SVAMP.")
+    parser = argparse.ArgumentParser(description="Fine-tune TRLM, GPT-2, Gemma4-Text, or DiffusionGemma on GSM8K + SVAMP.")
 
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2", "gemma4_text"])
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt, GPT-2 .safetensors/.pt, or Gemma4-Text checkpoint path")
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2", "gemma4_text", "diffusion_gemma"])
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt or an HF GPT-2/Gemma4-Text/DiffusionGemma checkpoint directory/file")
     parser.add_argument("--tokenizer_name", type=str, default="DogaOytc/TRLM-tokenizer")
     parser.add_argument("--output_dir", type=str, default="checkpoints_math")
     parser.add_argument("--hf_token_env", type=str, default="HF_TOKEN")
@@ -1401,6 +1925,24 @@ def parse_args():
     parser.add_argument("--gemma_hidden_size_per_layer_input", type=int, default=0)
     parser.add_argument("--gemma_tie_word_embeddings", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trust_remote_code", action=argparse.BooleanOptionalAction, default=False)
+
+    # DiffusionGemma loading, training objective, and generation knobs.
+    parser.add_argument("--diffusion_config_path", type=str, default=None, help="Optional DiffusionGemma config directory. Defaults to checkpoint directory.")
+    parser.add_argument("--diffusion_canvas_length", type=int, default=256, help="Fallback only; checkpoint config.canvas_length takes precedence.")
+    parser.add_argument("--diffusion_min_noise", type=float, default=0.05)
+    parser.add_argument("--diffusion_max_noise", type=float, default=1.0)
+    parser.add_argument("--diffusion_eval_noise", type=float, default=0.5)
+    parser.add_argument("--diffusion_self_conditioning_probability", type=float, default=0.0)
+    parser.add_argument("--diffusion_gen_steps", type=int, default=48)
+    parser.add_argument("--diffusion_entropy_bound", type=float, default=0.1)
+    parser.add_argument("--diffusion_t_min", type=float, default=0.4)
+    parser.add_argument("--diffusion_t_max", type=float, default=0.8)
+    parser.add_argument("--diffusion_stability_threshold", type=int, default=1)
+    parser.add_argument("--diffusion_confidence_threshold", type=float, default=0.005)
+    parser.add_argument("--diffusion_max_new_tokens", type=int, default=-1, help="If >0, fixed generated length. Otherwise uses the batch's maximum gold answer length.")
+    parser.add_argument("--diffusion_extra_new_tokens", type=int, default=0)
+    parser.add_argument("--diffusion_decode_gold_length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--diffusion_eval_seed", type=int, default=123456789)
 
     parser.add_argument("--answer_tolerance", type=float, default=1e-4)
     parser.add_argument("--logging_steps", type=int, default=10)
