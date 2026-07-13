@@ -114,7 +114,7 @@ python training/run_clm.py \
   --streaming_shuffle_buffer_size 10000 \
   --validation_split_percentage 1 \
   --block_size ${BLOCK_SIZE} \
-  --config_overrides "hidden_size=${HIDDEN_SIZE},intermediate_size=${GEMMA_INTERMEDIATE_SIZE},num_hidden_layers=${NUM_LAYERS},num_attention_heads=${NUM_HEADS},num_key_value_heads=${NUM_KV_HEADS},head_dim=${HEAD_DIM},global_head_dim=${HEAD_DIM},max_position_embeddings=${BLOCK_SIZE},hidden_activation=gelu_pytorch_tanh,rms_norm_eps=1e-6,attention_bias=false,attention_dropout=0.0,sliding_window=512,hidden_size_per_layer_input=0,use_cache=false,tie_word_embeddings=false" \
+  --config_overrides "hidden_size=${HIDDEN_SIZE},intermediate_size=${GEMMA_INTERMEDIATE_SIZE},num_hidden_layers=${NUM_LAYERS},num_attention_heads=${NUM_HEADS},num_key_value_heads=${NUM_KV_HEADS},head_dim=${HEAD_DIM},global_head_dim=${HEAD_DIM},max_position_embeddings=${BLOCK_SIZE},hidden_activation=gelu_pytorch_tanh,rms_norm_eps=1e-6,attention_bias=false,attention_dropout=0.0,sliding_window=512,hidden_size_per_layer_input=0,use_cache=false,tie_word_embeddings=true" \
   --do_train \
   --do_eval \
   --max_steps ${MAX_STEPS} \
