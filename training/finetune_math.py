@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fine-tune TRLM, GPT-2, Gemma4-Text, or DiffusionGemma on GSM8K + SVAMP and evaluate on their test splits.
+Fine-tune TRLM, GPT-2, Gemma4-Text, Mamba2, or DiffusionGemma on GSM8K + SVAMP and evaluate on their test splits.
 
 TRLM mode:
     Prompt tokens stay visible.
-    Answer tokens are replaced by [MASK].
+    A fixed answer canvas is filled with [MASK] tokens.
     Loss is computed only on answer tokens.
     Evaluation uses TRLM mask-filling generation.
+    By default, evaluation uses a fixed answer canvas instead of gold answer length.
 
-GPT-2 / Gemma4-Text mode:
+GPT-2 / Gemma4-Text / Mamba2 mode:
     Prompt + answer tokens are fed autoregressively.
     Prompt labels are -100, answer labels are visible for causal LM training.
     Evaluation generates the answer from the prompt with greedy decoding.
+    Mamba2 uses left padding, as recommended for batched Mamba2 execution.
 
 DiffusionGemma mode:
     Prompt tokens are encoded causally as context.
@@ -20,7 +22,7 @@ DiffusionGemma mode:
     Random answer positions are corrupted and reconstructed bidirectionally.
     Evaluation uses DiffusionGemma's iterative block-denoising generate().
 
-This lets you compare TRLM, GPT-2, Gemma4-Text, and DiffusionGemma on the same tokenizer,
+This lets you compare TRLM, GPT-2, Gemma4-Text, Mamba2, and DiffusionGemma on the same tokenizer,
 same prompts, same target formatting, same splits, and same numeric exact-match metric.
 """
 
@@ -33,6 +35,7 @@ import os
 import random
 import re
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -106,6 +109,54 @@ def get_autocast_dtype(name: str) -> Optional[torch.dtype]:
     return None
 
 
+def get_model_parameter_stats(model: torch.nn.Module, model_type: Optional[str] = None) -> Dict[str, Any]:
+    """Return de-duplicated total/trainable parameter counts and memory footprint."""
+    unique_parameters: Dict[int, torch.nn.Parameter] = {}
+    for parameter in model.parameters():
+        unique_parameters[id(parameter)] = parameter
+
+    total_parameters = sum(parameter.numel() for parameter in unique_parameters.values())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in unique_parameters.values() if parameter.requires_grad
+    )
+    parameter_bytes = sum(
+        parameter.numel() * parameter.element_size() for parameter in unique_parameters.values()
+    )
+
+    return {
+        "model_type": model_type,
+        "model_class": model.__class__.__name__,
+        "total_parameters": int(total_parameters),
+        "trainable_parameters": int(trainable_parameters),
+        "non_trainable_parameters": int(total_parameters - trainable_parameters),
+        "total_parameters_millions": float(total_parameters / 1_000_000),
+        "trainable_parameters_millions": float(trainable_parameters / 1_000_000),
+        "parameter_memory_bytes": int(parameter_bytes),
+        "parameter_memory_mib": float(parameter_bytes / (1024 ** 2)),
+    }
+
+
+def synchronize_device(device: torch.device) -> None:
+    """Synchronize accelerator work so wall-clock generation timings are accurate."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def slice_batch_item(batch: Dict[str, Any], index: int) -> Dict[str, Any]:
+    """Create a batch of size one while preserving tensor and metadata fields."""
+    single: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            single[key] = value[index : index + 1]
+        elif isinstance(value, list):
+            single[key] = value[index : index + 1]
+        elif isinstance(value, tuple):
+            single[key] = value[index : index + 1]
+        else:
+            single[key] = value
+    return single
+
+
 def normalize_number_text(x: Any) -> str:
     s = str(x).strip()
     s = s.replace(",", "")
@@ -151,7 +202,11 @@ def numeric_equal(pred: Optional[float], gold: Optional[float], tol: float = 1e-
 
 
 def is_causal_lm_type(model_type: str) -> bool:
-    return model_type in {"gpt2", "gemma4_text"}
+    return model_type in {"gpt2", "gemma4_text", "mamba2"}
+
+
+def is_mamba2_type(model_type: str) -> bool:
+    return model_type == "mamba2"
 
 
 def is_diffusion_lm_type(model_type: str) -> bool:
@@ -248,11 +303,14 @@ class MathPromptDataset(Dataset):
         source: str,
         target_mode: str = "reasoning",
         max_examples: Optional[int] = None,
+        split_name: str = "unknown",
     ) -> None:
-        self.examples: List[Dict[str, str]] = []
+        self.examples: List[Dict[str, Any]] = []
+        self.source = str(source)
+        self.split_name = str(split_name)
         n = len(hf_dataset) if max_examples is None else min(len(hf_dataset), max_examples)
 
-        for row in hf_dataset.select(range(n)):
+        for dataset_index, row in enumerate(hf_dataset.select(range(n))):
             if source == "gsm8k":
                 ex = format_gsm8k(row, target_mode=target_mode)
             elif source == "svamp":
@@ -261,12 +319,19 @@ class MathPromptDataset(Dataset):
                 raise ValueError(f"Unknown source: {source}")
 
             if extract_number(ex["gold_final"]) is not None:
+                # Stable across model runs when the same dataset split and seed
+                # are used. Prediction JSONL files can be joined by example_id.
+                ex["dataset_split"] = self.split_name
+                ex["dataset_index"] = int(dataset_index)
+                ex["example_id"] = (
+                    f"{self.source}_{self.split_name}_{dataset_index:05d}"
+                )
                 self.examples.append(ex)
 
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, idx: int) -> Dict[str, str]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.examples[idx]
 
 
@@ -348,30 +413,47 @@ class MathCollator:
                     "prompt_len": len(prompt_ids),
                     "answer_len": answer_len,
                     "source": ex["source"],
+                    "dataset_split": ex["dataset_split"],
+                    "dataset_index": ex["dataset_index"],
+                    "example_id": ex["example_id"],
                     "gold_final": ex["gold_final"],
                     "question": ex["question"],
                     "target_text": ex["target"],
                 })
                 continue
 
-            answer_ids = self._encode_answer(ex["target"], self.max_seq_len)
             min_prompt_tokens = 8
-            available_prompt_len = self.max_seq_len - len(answer_ids)
-            if available_prompt_len < min_prompt_tokens:
-                answer_ids = answer_ids[-(self.max_seq_len - min_prompt_tokens):]
+
+            if self.model_type == "trlm":
+                answer_canvas_len = min(
+                    self.max_answer_tokens,
+                    self.max_seq_len - min_prompt_tokens,
+                )
+                answer_ids = self._encode_answer(ex["target"], answer_canvas_len)
+                available_prompt_len = self.max_seq_len - answer_canvas_len
+            else:
+                answer_ids = self._encode_answer(ex["target"], self.max_seq_len)
                 available_prompt_len = self.max_seq_len - len(answer_ids)
+                if available_prompt_len < min_prompt_tokens:
+                    answer_ids = answer_ids[-(self.max_seq_len - min_prompt_tokens):]
+                    available_prompt_len = self.max_seq_len - len(answer_ids)
 
             if len(prompt_ids) > available_prompt_len:
                 prompt_ids = prompt_ids[-available_prompt_len:]
 
             if self.model_type == "trlm":
-                input_ids = prompt_ids + [self.tokenizer.mask_token_id] * len(answer_ids)
+                input_ids = prompt_ids + [self.tokenizer.mask_token_id] * answer_canvas_len
+                labels = (
+                    [-100] * len(prompt_ids)
+                    + answer_ids
+                    + [-100] * (answer_canvas_len - len(answer_ids))
+                )
             elif is_causal_lm_type(self.model_type):
                 input_ids = prompt_ids + answer_ids
+                labels = [-100] * len(prompt_ids) + answer_ids
             else:
                 raise ValueError(f"Unsupported model_type: {self.model_type}")
 
-            labels = [-100] * len(prompt_ids) + answer_ids
             attention_mask = [1] * len(input_ids)
 
             encoded_rows.append({
@@ -381,6 +463,9 @@ class MathCollator:
                 "prompt_len": len(prompt_ids),
                 "answer_len": len(answer_ids),
                 "source": ex["source"],
+                "dataset_split": ex["dataset_split"],
+                "dataset_index": ex["dataset_index"],
+                "example_id": ex["example_id"],
                 "gold_final": ex["gold_final"],
                 "question": ex["question"],
                 "target_text": ex["target"],
@@ -413,10 +498,13 @@ class MathCollator:
                 "masked_input_ids": input_tensor,
                 "labels": torch.tensor([r["labels"] for r in encoded_rows], dtype=torch.long),
                 "clean_canvas": torch.tensor([r["clean_canvas"] for r in encoded_rows], dtype=torch.long),
-                "attention_mask": torch.tensor(mask_batch, dtype=torch.long),
+                "attention_mask": torch.tensor(mask_batch, dtype=torch.bool),
                 "prompt_lens": torch.tensor([r["prompt_len"] for r in encoded_rows], dtype=torch.long),
                 "answer_lens": torch.tensor([r["answer_len"] for r in encoded_rows], dtype=torch.long),
                 "sources": [r["source"] for r in encoded_rows],
+                "dataset_splits": [r["dataset_split"] for r in encoded_rows],
+                "dataset_indices": [r["dataset_index"] for r in encoded_rows],
+                "example_ids": [r["example_id"] for r in encoded_rows],
                 "gold_finals": [r["gold_final"] for r in encoded_rows],
                 "questions": [r["question"] for r in encoded_rows],
                 "target_texts": [r["target_text"] for r in encoded_rows],
@@ -431,14 +519,28 @@ class MathCollator:
         for row in encoded_rows:
             pad_len = batch_len - len(row["input_ids"])
             if pad_len < 0:
-                row["input_ids"] = row["input_ids"][:batch_len]
-                row["labels"] = row["labels"][:batch_len]
-                row["attention_mask"] = row["attention_mask"][:batch_len]
+                # Mamba2 should preserve the answer-side tail when truncation is
+                # ever necessary. Other causal baselines retain the old behavior.
+                if is_mamba2_type(self.model_type):
+                    row["input_ids"] = row["input_ids"][-batch_len:]
+                    row["labels"] = row["labels"][-batch_len:]
+                    row["attention_mask"] = row["attention_mask"][-batch_len:]
+                else:
+                    row["input_ids"] = row["input_ids"][:batch_len]
+                    row["labels"] = row["labels"][:batch_len]
+                    row["attention_mask"] = row["attention_mask"][:batch_len]
                 pad_len = 0
 
-            input_batch.append(row["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
-            label_batch.append(row["labels"] + [-100] * pad_len)
-            mask_batch.append(row["attention_mask"] + [0] * pad_len)
+            if is_mamba2_type(self.model_type):
+                # Hugging Face's Mamba2 implementation is primarily tested with
+                # left padding. Right padding can propagate recurrent-state noise.
+                input_batch.append([self.tokenizer.pad_token_id] * pad_len + row["input_ids"])
+                label_batch.append([-100] * pad_len + row["labels"])
+                mask_batch.append([0] * pad_len + row["attention_mask"])
+            else:
+                input_batch.append(row["input_ids"] + [self.tokenizer.pad_token_id] * pad_len)
+                label_batch.append(row["labels"] + [-100] * pad_len)
+                mask_batch.append(row["attention_mask"] + [0] * pad_len)
 
         input_tensor = torch.tensor(input_batch, dtype=torch.long)
         return {
@@ -449,6 +551,9 @@ class MathCollator:
             "prompt_lens": torch.tensor([r["prompt_len"] for r in encoded_rows], dtype=torch.long),
             "answer_lens": torch.tensor([r["answer_len"] for r in encoded_rows], dtype=torch.long),
             "sources": [r["source"] for r in encoded_rows],
+            "dataset_splits": [r["dataset_split"] for r in encoded_rows],
+            "dataset_indices": [r["dataset_index"] for r in encoded_rows],
+            "example_ids": [r["example_id"] for r in encoded_rows],
             "gold_finals": [r["gold_final"] for r in encoded_rows],
             "questions": [r["question"] for r in encoded_rows],
             "target_texts": [r["target_text"] for r in encoded_rows],
@@ -504,18 +609,18 @@ def build_datasets(args) -> Tuple[Dataset, Dataset, Dataset, Dataset]:
     val_parts: List[Dataset] = []
 
     if args.use_gsm8k:
-        train_parts.append(MathPromptDataset(gsm_train, "gsm8k", args.target_mode, args.max_train_gsm8k))
-        val_parts.append(MathPromptDataset(gsm_val, "gsm8k", args.target_mode, args.max_val_gsm8k))
-        gsm_test_ds = MathPromptDataset(gsm_test, "gsm8k", args.target_mode, args.max_test_gsm8k)
+        train_parts.append(MathPromptDataset(gsm_train, "gsm8k", args.target_mode, args.max_train_gsm8k, split_name="train"))
+        val_parts.append(MathPromptDataset(gsm_val, "gsm8k", args.target_mode, args.max_val_gsm8k, split_name="validation"))
+        gsm_test_ds = MathPromptDataset(gsm_test, "gsm8k", args.target_mode, args.max_test_gsm8k, split_name="test")
     else:
-        gsm_test_ds = MathPromptDataset(gsm_test.select(range(0)), "gsm8k", args.target_mode)
+        gsm_test_ds = MathPromptDataset(gsm_test.select(range(0)), "gsm8k", args.target_mode, split_name="test")
 
     if args.use_svamp:
-        train_parts.append(MathPromptDataset(sv_train, "svamp", args.target_mode, args.max_train_svamp))
-        val_parts.append(MathPromptDataset(sv_val, "svamp", args.target_mode, args.max_val_svamp))
-        svamp_test_ds = MathPromptDataset(sv_test, "svamp", args.target_mode, args.max_test_svamp)
+        train_parts.append(MathPromptDataset(sv_train, "svamp", args.target_mode, args.max_train_svamp, split_name="train"))
+        val_parts.append(MathPromptDataset(sv_val, "svamp", args.target_mode, args.max_val_svamp, split_name="validation"))
+        svamp_test_ds = MathPromptDataset(sv_test, "svamp", args.target_mode, args.max_test_svamp, split_name="test")
     else:
-        svamp_test_ds = MathPromptDataset(sv_test.select(range(0)), "svamp", args.target_mode)
+        svamp_test_ds = MathPromptDataset(sv_test.select(range(0)), "svamp", args.target_mode, split_name="test")
 
     if not train_parts:
         raise ValueError("At least one training dataset must be enabled.")
@@ -542,6 +647,8 @@ def resolve_model_type(args) -> str:
                 model_type = str(json.load(f).get("model_type", "")).lower()
             if model_type == "diffusion_gemma" or "diffusion_gemma" in model_type:
                 return "diffusion_gemma"
+            if model_type == "mamba2" or "mamba2" in model_type:
+                return "mamba2"
             if "gemma" in model_type:
                 return "gemma4_text"
             if "gpt2" in model_type or "gpt" in model_type:
@@ -565,6 +672,10 @@ def load_tokenizer(args):
         if tokenizer.eos_token is None:
             raise ValueError("Tokenizer must define either pad_token or eos_token.")
         tokenizer.pad_token = tokenizer.eos_token
+    if is_mamba2_type(args.model_type_resolved):
+        # Mamba2 masks padding states but its recurrent dynamics are primarily
+        # validated with left padding; right padding may pollute later states.
+        tokenizer.padding_side = "left"
     return tokenizer
 
 
@@ -943,6 +1054,134 @@ def load_gemma4_text_model(args, tokenizer):
 
 
 
+def _set_standard_hf_tokenizer_ids(config, tokenizer) -> None:
+    config.vocab_size = len(tokenizer)
+    config.pad_token_id = tokenizer.pad_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        config.bos_token_id = tokenizer.bos_token_id
+
+
+def load_mamba2_model(args, tokenizer):
+    """Load a pretrained Hugging Face Mamba2 causal-LM checkpoint."""
+    try:
+        from transformers import Mamba2ForCausalLM
+    except ImportError as exc:
+        raise ImportError(
+            "Could not import Mamba2ForCausalLM. Install a Transformers build "
+            "that includes Mamba2 support."
+        ) from exc
+
+    ckpt_path = Path(args.checkpoint_path)
+    checkpoint_dir = ckpt_path if ckpt_path.is_dir() else ckpt_path.parent
+    config_source = args.mamba2_config_path or str(checkpoint_dir)
+
+    config = AutoConfig.from_pretrained(
+        config_source,
+        trust_remote_code=args.trust_remote_code,
+    )
+    if getattr(config, "model_type", None) != "mamba2":
+        raise ValueError(
+            f"Expected a mamba2 config, got model_type={getattr(config, 'model_type', None)!r}."
+        )
+
+    checkpoint_vocab = int(getattr(config, "vocab_size"))
+    if checkpoint_vocab != len(tokenizer) and not args.allow_resize_token_embeddings:
+        raise ValueError(
+            f"Mamba2 vocab mismatch: checkpoint vocab_size={checkpoint_vocab}, "
+            f"len(tokenizer)={len(tokenizer)}. Use the pretraining tokenizer or pass "
+            "--allow_resize_token_embeddings."
+        )
+
+    hidden_size = int(getattr(config, "hidden_size"))
+    expand = int(getattr(config, "expand"))
+    num_heads = int(getattr(config, "num_heads"))
+    head_dim = int(getattr(config, "head_dim"))
+    if hidden_size * expand != num_heads * head_dim:
+        raise ValueError(
+            "Invalid Mamba2 checkpoint dimensions: "
+            f"hidden_size*expand={hidden_size * expand}, "
+            f"num_heads*head_dim={num_heads * head_dim}."
+        )
+
+    config.pad_token_id = tokenizer.pad_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    if tokenizer.bos_token_id is not None:
+        config.bos_token_id = tokenizer.bos_token_id
+    # Fine-tuning computes full-sequence loss and does not need recurrent cache.
+    config.use_cache = False
+
+    has_hf_weights = any(
+        (checkpoint_dir / name).exists()
+        for name in (
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+        )
+    )
+
+    if has_hf_weights:
+        model = Mamba2ForCausalLM.from_pretrained(
+            str(checkpoint_dir),
+            config=config,
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        if ckpt_path.is_dir():
+            raise FileNotFoundError(
+                f"No Hugging Face model weights were found in {checkpoint_dir}."
+            )
+        state, _ = load_checkpoint_dict(args.checkpoint_path)
+        state = strip_wrapper_prefixes(state)
+        model = Mamba2ForCausalLM(config)
+        state = align_state_dict_keys_to_model(state, model)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+
+        allowed_missing = set()
+        if bool(getattr(config, "tie_word_embeddings", False)):
+            allowed_missing.add("lm_head.weight")
+        serious_missing = [key for key in missing if key not in allowed_missing]
+        print(f"Mamba2 missing keys: {len(missing)} | unexpected keys: {len(unexpected)}")
+        if serious_missing:
+            print(f"First missing keys: {serious_missing[:10]}")
+        if unexpected:
+            print(f"First unexpected keys: {unexpected[:10]}")
+        if len(serious_missing) > 10 or len(unexpected) > 10:
+            raise RuntimeError(
+                "Mamba2 checkpoint did not load cleanly. This usually indicates "
+                "a model-class, config, or state-dict prefix mismatch."
+            )
+
+    if checkpoint_vocab != len(tokenizer):
+        model.resize_token_embeddings(len(tokenizer))
+        model.config.vocab_size = len(tokenizer)
+        model.tie_weights()
+
+    _set_standard_hf_tokenizer_ids(model.config, tokenizer)
+    model.config.use_cache = False
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+        if tokenizer.bos_token_id is not None:
+            model.generation_config.bos_token_id = tokenizer.bos_token_id
+
+    n_params = sum({parameter.data_ptr(): parameter.numel() for parameter in model.parameters()}.values())
+    print(f"Loaded Mamba2 checkpoint: {checkpoint_dir}")
+    print(
+        "Mamba2 config: "
+        f"layers={getattr(model.config, 'num_hidden_layers', 'NA')}, "
+        f"hidden={getattr(model.config, 'hidden_size', 'NA')}, "
+        f"expand={getattr(model.config, 'expand', 'NA')}, "
+        f"heads={getattr(model.config, 'num_heads', 'NA')}, "
+        f"head_dim={getattr(model.config, 'head_dim', 'NA')}, "
+        f"state_size={getattr(model.config, 'state_size', 'NA')}, "
+        f"groups={getattr(model.config, 'n_groups', 'NA')}, "
+        f"params={n_params / 1_000_000:.2f}M"
+    )
+    return model
+
+
 def patch_diffusion_gemma_text_only_encoder() -> None:
     """Allow Transformers 5.13.x DiffusionGemma to load a text-only checkpoint."""
     try:
@@ -1131,6 +1370,8 @@ def load_model(args, tokenizer):
         return load_gpt2_model(args, tokenizer)
     if args.model_type_resolved == "gemma4_text":
         return load_gemma4_text_model(args, tokenizer)
+    if args.model_type_resolved == "mamba2":
+        return load_mamba2_model(args, tokenizer)
     if args.model_type_resolved == "diffusion_gemma":
         return load_diffusion_gemma_model(args, tokenizer)
     raise ValueError(f"Unsupported model_type: {args.model_type_resolved}")
@@ -1269,9 +1510,19 @@ def diffusion_gemma_loss(
     noisy_canvas = torch.where(target_mask, clean_canvas, random_tokens)
     noisy_canvas = torch.where(corruption_mask, random_tokens, noisy_canvas)
 
-    encoder_attention_mask = batch["attention_mask"]
+    # DiffusionGemma's decoder mask can reach PyTorch SDPA directly.
+    # SDPA accepts a boolean mask or an additive floating-point mask, but not
+    # the int64 0/1 mask produced by the collator. Keep 1/0 semantics by using
+    # bool (True = attend, False = masked). Do NOT merely cast 0/1 to float,
+    # because a floating-point SDPA mask is interpreted as an additive bias.
+    encoder_attention_mask = batch["attention_mask"].to(dtype=torch.bool)
+    canvas_attention_mask = torch.ones(
+        clean_canvas.shape,
+        dtype=torch.bool,
+        device=clean_canvas.device,
+    )
     decoder_attention_mask = torch.cat(
-        [encoder_attention_mask, torch.ones_like(clean_canvas)], dim=1
+        [encoder_attention_mask, canvas_attention_mask], dim=1
     )
     model_kwargs = {
         "input_ids": batch["input_ids"],
@@ -1356,11 +1607,15 @@ def forward_loss(
     if is_diffusion_lm_type(args.model_type_resolved):
         return diffusion_gemma_loss(model, batch, args, generator=generator)
 
-    outputs = model(
-        input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
-        labels=batch["labels"],
-    )
+    model_kwargs = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "labels": batch["labels"],
+    }
+    if is_mamba2_type(args.model_type_resolved):
+        # Full-sequence SFT does not need the recurrent generation cache.
+        model_kwargs["use_cache"] = False
+    outputs = model(**model_kwargs)
     return outputs.loss, {
         "lm_loss": float(outputs.loss.item()),
         "short_lm": 0.0,
@@ -1369,18 +1624,151 @@ def forward_loss(
     }
 
 
+def get_eval_answer_tokens(args) -> int:
+    """Return the fixed answer canvas used by non-oracle generation evaluation."""
+    configured = int(getattr(args, "eval_answer_tokens", -1))
+    if configured > 0:
+        return configured
+    return int(args.max_answer_tokens)
+
+
+def uses_oracle_answer_length(args) -> bool:
+    return getattr(args, "eval_length_mode", "fixed") == "oracle"
+
+
+def truncate_at_generation_stop(ids: torch.Tensor, tokenizer) -> List[int]:
+    """Drop everything after the first generated EOS/PAD/MASK token."""
+    stop_ids = {
+        token_id
+        for token_id in (
+            getattr(tokenizer, "eos_token_id", None),
+            getattr(tokenizer, "pad_token_id", None),
+            getattr(tokenizer, "mask_token_id", None),
+        )
+        if token_id is not None
+    }
+    output: List[int] = []
+    for token_id in ids.detach().cpu().tolist():
+        token_id = int(token_id)
+        if token_id in stop_ids:
+            break
+        output.append(token_id)
+    return output
+
+
 @torch.no_grad()
-def generate_trlm(model: TRLM, batch: Dict[str, Any], tokenizer, args) -> torch.Tensor:
+def generate_trlm(
+    model: TRLM,
+    batch: Dict[str, Any],
+    tokenizer,
+    args,
+) -> torch.Tensor:
+    """
+    Generate a TRLM answer with a single latent-recursion pass.
+
+    Fixed evaluation:
+        Rebuilds every example as prompt + a fixed number of MASK tokens.
+
+    Oracle evaluation:
+        Uses the mask canvas already prepared by the collator and decodes only
+        the gold answer length. Oracle mode should only be used for ablations.
+    """
+
+    if not uses_oracle_answer_length(args):
+        input_ids = batch["input_ids"]
+        prompt_lens = batch["prompt_lens"].detach().cpu().tolist()
+
+        fixed_answer_tokens = get_eval_answer_tokens(args)
+        max_prompt_len = max(
+            1,
+            int(args.max_seq_len) - fixed_answer_tokens,
+        )
+
+        rows: List[torch.Tensor] = []
+        row_lengths: List[int] = []
+
+        for row_index, prompt_len in enumerate(prompt_lens):
+            # TRLM batches are right padded. Real prompt tokens begin at index 0.
+            prompt = input_ids[row_index, :prompt_len]
+
+            if prompt.numel() > max_prompt_len:
+                prompt = prompt[-max_prompt_len:]
+
+            mask_block = torch.full(
+                (fixed_answer_tokens,),
+                tokenizer.mask_token_id,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+
+            row = torch.cat(
+                [prompt, mask_block],
+                dim=0,
+            )
+
+            rows.append(row)
+            row_lengths.append(int(row.numel()))
+            prompt_lens[row_index] = int(prompt.numel())
+
+        batch_len = max(row_lengths)
+        padded_rows: List[torch.Tensor] = []
+
+        for row in rows:
+            pad_len = batch_len - int(row.numel())
+
+            if pad_len > 0:
+                padding = torch.full(
+                    (pad_len,),
+                    tokenizer.pad_token_id,
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                row = torch.cat([row, padding], dim=0)
+
+            padded_rows.append(row)
+
+        rebuilt_input_ids = torch.stack(
+            padded_rows,
+            dim=0,
+        )
+
+        # Do not mutate more batch fields than necessary.
+        batch["input_ids"] = rebuilt_input_ids
+        batch["masked_input_ids"] = rebuilt_input_ids
+        batch["attention_mask"] = rebuilt_input_ids.ne(
+            tokenizer.pad_token_id
+        ).long()
+
+        batch["prompt_lens"] = torch.tensor(
+            prompt_lens,
+            dtype=batch["prompt_lens"].dtype,
+            device=batch["prompt_lens"].device,
+        )
+
+    forbidden_token_ids: List[int] = []
+
+    # PAD should not occur inside the answer. Do not forbid it when PAD and EOS
+    # share the same token ID, because that would also forbid EOS.
+    if (
+        tokenizer.pad_token_id is not None
+        and tokenizer.pad_token_id != tokenizer.eos_token_id
+    ):
+        forbidden_token_ids.append(tokenizer.pad_token_id)
+
+    # BOS is also not a valid answer-continuation token.
+    if (
+        tokenizer.bos_token_id is not None
+        and tokenizer.bos_token_id != tokenizer.eos_token_id
+        and tokenizer.bos_token_id != tokenizer.pad_token_id
+    ):
+        forbidden_token_ids.append(tokenizer.bos_token_id)
+
     return model.generate(
         masked_input_ids=batch["input_ids"],
-        num_iterations=args.gen_iterations,
         recursion_steps=args.recursion_steps,
-        temperature=0.0,
-        top_k=None,
-        do_sample=False,
-        remask_ratio_start=args.remask_ratio_start,
-        remask_ratio_end=0.0,
         forbid_mask_token=True,
+        forbid_token_ids=forbidden_token_ids,
+        return_confidence=False,
     )
 
 
@@ -1396,10 +1784,10 @@ def generate_diffusion_gemma(model, batch: Dict[str, Any], tokenizer, args) -> t
     answer_lens = batch["answer_lens"].detach().cpu().tolist()
     if args.diffusion_max_new_tokens > 0:
         max_new_tokens = args.diffusion_max_new_tokens
-    elif args.diffusion_decode_gold_length:
+    elif uses_oracle_answer_length(args) and args.diffusion_decode_gold_length:
         max_new_tokens = max(answer_lens) + args.diffusion_extra_new_tokens
     else:
-        max_new_tokens = int(args.diffusion_canvas_length)
+        max_new_tokens = get_eval_answer_tokens(args)
     max_new_tokens = max(1, int(max_new_tokens))
 
     generation_config = DiffusionGemmaGenerationConfig(
@@ -1419,7 +1807,9 @@ def generate_diffusion_gemma(model, batch: Dict[str, Any], tokenizer, args) -> t
 
     generated = model.generate(
         input_ids=batch["input_ids"],
-        attention_mask=batch["attention_mask"],
+        # Keep the mask boolean so DiffusionGemma's decoder can pass it safely
+        # to PyTorch SDPA during iterative denoising as well.
+        attention_mask=batch["attention_mask"].to(dtype=torch.bool),
         generation_config=generation_config,
     )
     return generated.sequences if hasattr(generated, "sequences") else generated
@@ -1436,7 +1826,15 @@ def generate_causal_lm(model, batch: Dict[str, Any], tokenizer, args, device: to
     max_prompt_len = max(prompt_lens)
 
     for i, plen in enumerate(prompt_lens):
-        prompt = input_ids[i, :plen]
+        if is_mamba2_type(args.model_type_resolved):
+            # Mamba2 training batches are left padded and contain prompt+answer.
+            # Recover only the real prompt, excluding both left padding and the
+            # teacher-forced answer tokens.
+            answer_len = answer_lens[i]
+            prompt_start = input_ids.shape[1] - (plen + answer_len)
+            prompt = input_ids[i, prompt_start : prompt_start + plen]
+        else:
+            prompt = input_ids[i, :plen]
         pad_len = max_prompt_len - plen
         # Left padding is safer for decoder-only generation because the last
         # non-pad token is aligned at the same position for every sample.
@@ -1452,11 +1850,19 @@ def generate_causal_lm(model, batch: Dict[str, Any], tokenizer, args, device: to
     prompt_batch = torch.stack(prompt_rows, dim=0)
     prompt_attention = torch.stack(prompt_masks, dim=0)
 
-    if args.gpt2_max_new_tokens > 0:
-        max_new_tokens = args.gpt2_max_new_tokens
+    if is_mamba2_type(args.model_type_resolved):
+        fixed_max_new_tokens = args.mamba2_max_new_tokens
+        extra_new_tokens = args.mamba2_extra_new_tokens
     else:
-        # Comparable to TRLM's oracle target length, but generated autoregressively.
-        max_new_tokens = max(answer_lens) + args.gpt2_extra_new_tokens
+        fixed_max_new_tokens = args.gpt2_max_new_tokens
+        extra_new_tokens = args.gpt2_extra_new_tokens
+
+    if fixed_max_new_tokens > 0:
+        max_new_tokens = fixed_max_new_tokens
+    elif uses_oracle_answer_length(args):
+        max_new_tokens = max(answer_lens) + extra_new_tokens
+    else:
+        max_new_tokens = get_eval_answer_tokens(args)
 
     generated = model.generate(
         input_ids=prompt_batch,
@@ -1475,6 +1881,87 @@ def generate_causal_lm(model, batch: Dict[str, Any], tokenizer, args, device: to
 
 
 @torch.no_grad()
+def generate_for_evaluation(
+    model,
+    batch: Dict[str, Any],
+    tokenizer,
+    args,
+    device: torch.device,
+    seed_offset: int = 0,
+) -> torch.Tensor:
+    """Dispatch generation while keeping DiffusionGemma evaluation reproducible."""
+    if args.model_type_resolved == "trlm":
+        return generate_trlm(model, batch, tokenizer, args)
+
+    if is_diffusion_lm_type(args.model_type_resolved):
+        # Preserve the surrounding training/evaluation RNG stream.
+        cpu_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = None
+        if device.type == "cuda":
+            cuda_rng_state = torch.cuda.get_rng_state(device)
+
+        eval_seed = int(args.diffusion_eval_seed) + int(seed_offset)
+        torch.manual_seed(eval_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed(eval_seed)
+
+        try:
+            return generate_diffusion_gemma(model, batch, tokenizer, args)
+        finally:
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, device)
+
+    return generate_causal_lm(model, batch, tokenizer, args, device)
+
+
+def decode_generated_answer(
+    generated: torch.Tensor,
+    batch: Dict[str, Any],
+    row_index: int,
+    tokenizer,
+    args,
+) -> str:
+    """Decode only the generated answer portion for one row."""
+    prompt_lens = batch["prompt_lens"].detach().cpu().tolist()
+    answer_lens = batch["answer_lens"].detach().cpu().tolist()
+
+    if args.model_type_resolved == "trlm":
+        start = prompt_lens[row_index]
+        if uses_oracle_answer_length(args):
+            end = start + answer_lens[row_index]
+        else:
+            end = start + get_eval_answer_tokens(args)
+        pred_ids = generated[row_index, start:end]
+    elif is_diffusion_lm_type(args.model_type_resolved):
+        # DiffusionGemma returns left-padded prompt + denoised continuation.
+        start = batch["input_ids"].shape[1]
+        if uses_oracle_answer_length(args) and args.diffusion_decode_gold_length:
+            end = start + answer_lens[row_index]
+        else:
+            end = generated.size(1)
+        pred_ids = generated[row_index, start:end]
+    else:
+        # Causal generation returns left-padded prompt + continuation.
+        start = max(prompt_lens)
+        decode_gold_length = (
+            args.mamba2_decode_gold_length
+            if is_mamba2_type(args.model_type_resolved)
+            else args.gpt2_decode_gold_length
+        )
+        if uses_oracle_answer_length(args) and decode_gold_length:
+            end = start + answer_lens[row_index]
+        else:
+            end = generated.size(1)
+        pred_ids = generated[row_index, start:end]
+
+    return tokenizer.decode(
+        truncate_at_generation_stop(pred_ids, tokenizer),
+        skip_special_tokens=True,
+    )
+
+
+@torch.no_grad()
 def evaluate_generation(
     model,
     loader: DataLoader,
@@ -1490,6 +1977,17 @@ def evaluate_generation(
     total_loss = 0.0
     loss_batches = 0
     predictions: List[Dict[str, Any]] = []
+
+    # Test evaluations pass a predictions path. Generate those examples one at
+    # a time so each answer has a real, independently measured latency rather
+    # than an imprecise batch-time estimate.
+    measure_per_sample_latency = save_predictions_path is not None
+    generation_times: List[float] = []
+    total_generation_wall_time = 0.0
+    dataset_wall_start = time.perf_counter()
+    global_example_index = 0
+
+    model_info = get_model_parameter_stats(model, args.model_type_resolved)
 
     autocast_dtype = get_autocast_dtype(args.mixed_precision)
     use_autocast = autocast_dtype is not None and device.type == "cuda"
@@ -1516,77 +2014,128 @@ def evaluate_generation(
         total_loss += float(loss.item())
         loss_batches += 1
 
-        if args.model_type_resolved == "trlm":
-            generated = generate_trlm(model, batch, tokenizer, args).detach().cpu()
-        elif is_diffusion_lm_type(args.model_type_resolved):
-            # Make stochastic diffusion evaluation repeatable without changing
-            # the RNG stream used by the surrounding training loop.
-            cpu_rng_state = torch.random.get_rng_state()
-            cuda_rng_state = None
-            if device.type == "cuda":
-                cuda_rng_state = torch.cuda.get_rng_state(device)
-            eval_seed = int(args.diffusion_eval_seed) + int(batch_idx)
-            torch.manual_seed(eval_seed)
-            if device.type == "cuda":
-                torch.cuda.manual_seed(eval_seed)
-            try:
-                generated = generate_diffusion_gemma(model, batch, tokenizer, args).detach().cpu()
-            finally:
-                torch.random.set_rng_state(cpu_rng_state)
-                if cuda_rng_state is not None:
-                    torch.cuda.set_rng_state(cuda_rng_state, device)
+        batch_size = int(batch["input_ids"].shape[0])
+
+        if measure_per_sample_latency:
+            generation_records: List[Tuple[torch.Tensor, Dict[str, Any], int, float]] = []
+            for row_index in range(batch_size):
+                single_batch = slice_batch_item(batch, row_index)
+
+                synchronize_device(device)
+                generation_start = time.perf_counter()
+                generated_device = generate_for_evaluation(
+                    model,
+                    single_batch,
+                    tokenizer,
+                    args,
+                    device,
+                    seed_offset=global_example_index + row_index,
+                )
+                synchronize_device(device)
+                generation_seconds = time.perf_counter() - generation_start
+
+                total_generation_wall_time += generation_seconds
+                generation_times.append(generation_seconds)
+                generation_records.append(
+                    (generated_device.detach().cpu(), single_batch, 0, generation_seconds)
+                )
         else:
-            generated = generate_causal_lm(model, batch, tokenizer, args, device).detach().cpu()
+            synchronize_device(device)
+            generation_start = time.perf_counter()
+            generated_device = generate_for_evaluation(
+                model,
+                batch,
+                tokenizer,
+                args,
+                device,
+                seed_offset=batch_idx,
+            )
+            synchronize_device(device)
+            batch_generation_seconds = time.perf_counter() - generation_start
+            total_generation_wall_time += batch_generation_seconds
 
-        prompt_lens = batch["prompt_lens"].detach().cpu().tolist()
-        answer_lens = batch["answer_lens"].detach().cpu().tolist()
-        gold_finals = batch["gold_finals"]
-        questions = batch["questions"]
-        sources = batch["sources"]
+            generated_cpu = generated_device.detach().cpu()
+            generation_records = [
+                (generated_cpu, batch, row_index, float("nan"))
+                for row_index in range(batch_size)
+            ]
 
-        for i in range(generated.size(0)):
-            if args.model_type_resolved == "trlm":
-                start = prompt_lens[i]
-                end = start + answer_lens[i]
-                pred_ids = generated[i, start:end]
-            elif is_diffusion_lm_type(args.model_type_resolved):
-                # DiffusionGemma generation returns left-padded prompt + denoised continuation.
-                start = batch["input_ids"].shape[1]
-                if args.diffusion_decode_gold_length:
-                    end = start + answer_lens[i]
-                else:
-                    end = generated.size(1)
-                pred_ids = generated[i, start:end]
-            else:
-                # generated contains left-padded prompt + continuation.
-                start = max(prompt_lens)
-                if args.gpt2_decode_gold_length:
-                    end = start + answer_lens[i]
-                else:
-                    end = generated.size(1)
-                pred_ids = generated[i, start:end]
-
-            pred_text = tokenizer.decode(pred_ids, skip_special_tokens=True)
+        for generated, example_batch, decode_row_index, generation_seconds in generation_records:
+            pred_text = decode_generated_answer(
+                generated,
+                example_batch,
+                row_index=decode_row_index,
+                tokenizer=tokenizer,
+                args=args,
+            )
             pred_num = extract_number(pred_text)
-            gold_num = extract_number(gold_finals[i])
+            gold_final = example_batch["gold_finals"][decode_row_index]
+            gold_num = extract_number(gold_final)
             is_correct = numeric_equal(pred_num, gold_num, tol=args.answer_tolerance)
 
             total += 1
             correct += int(is_correct)
 
-            if save_predictions_path and len(predictions) < args.max_saved_predictions:
+            should_save = (
+                save_predictions_path is not None
+                and (
+                    args.max_saved_predictions < 0
+                    or len(predictions) < args.max_saved_predictions
+                )
+            )
+            if should_save:
                 predictions.append({
-                    "source": sources[i],
-                    "question": questions[i],
+                    "model_type": args.model_type_resolved,
+                    "model_class": model_info["model_class"],
+                    "eval_length_mode": getattr(args, "eval_length_mode", "fixed"),
+                    "eval_answer_tokens": get_eval_answer_tokens(args),
+                    "gold_answer_tokens": int(example_batch["answer_lens"][decode_row_index].detach().cpu().item()),
+                    "model_total_parameters": model_info["total_parameters"],
+                    "model_trainable_parameters": model_info["trainable_parameters"],
+                    "example_id": example_batch["example_ids"][decode_row_index],
+                    "dataset_split": example_batch["dataset_splits"][decode_row_index],
+                    "dataset_index": example_batch["dataset_indices"][decode_row_index],
+                    "source": example_batch["sources"][decode_row_index],
+                    "question": example_batch["questions"][decode_row_index],
                     "prediction_text": pred_text,
                     "prediction_number": pred_num,
-                    "gold": gold_finals[i],
+                    "gold": gold_final,
                     "gold_number": gold_num,
                     "correct": is_correct,
+                    "generation_time_seconds": generation_seconds,
+                    "generation_time_ms": generation_seconds * 1000.0,
                 })
 
+        global_example_index += batch_size
         acc = correct / max(1, total)
-        pbar.set_postfix({"acc": f"{acc:.4f}", "loss": f"{total_loss / max(1, loss_batches):.4f}"})
+        postfix = {
+            "acc": f"{acc:.4f}",
+            "loss": f"{total_loss / max(1, loss_batches):.4f}",
+        }
+        if measure_per_sample_latency and generation_times:
+            postfix["avg_ms"] = f"{np.mean(generation_times) * 1000.0:.2f}"
+        pbar.set_postfix(postfix)
+
+    synchronize_device(device)
+    dataset_wall_time = time.perf_counter() - dataset_wall_start
+
+    if generation_times:
+        latency_array = np.asarray(generation_times, dtype=np.float64)
+        average_generation_time = float(latency_array.mean())
+        median_generation_time = float(np.median(latency_array))
+        p95_generation_time = float(np.percentile(latency_array, 95))
+        min_generation_time = float(latency_array.min())
+        max_generation_time = float(latency_array.max())
+    else:
+        # Validation remains batched for speed, so individual latency
+        # statistics are intentionally unavailable there.
+        average_generation_time = (
+            float(total_generation_wall_time / total) if total > 0 else 0.0
+        )
+        median_generation_time = None
+        p95_generation_time = None
+        min_generation_time = None
+        max_generation_time = None
 
     metrics = {
         "name": name,
@@ -1594,6 +2143,32 @@ def evaluate_generation(
         "accuracy": correct / max(1, total),
         "correct": correct,
         "total": total,
+        "timing_mode": (
+            "per_sample_sequential"
+            if measure_per_sample_latency
+            else "batched_generation"
+        ),
+        "dataset_wall_time_seconds": float(dataset_wall_time),
+        "total_generation_time_seconds": float(total_generation_wall_time),
+        "average_generation_time_seconds": average_generation_time,
+        "average_generation_time_ms": average_generation_time * 1000.0,
+        "median_generation_time_seconds": median_generation_time,
+        "p95_generation_time_seconds": p95_generation_time,
+        "min_generation_time_seconds": min_generation_time,
+        "max_generation_time_seconds": max_generation_time,
+        "evaluation_examples_per_second": (
+            float(total / dataset_wall_time) if dataset_wall_time > 0 else 0.0
+        ),
+        "generation_examples_per_second": (
+            float(total / total_generation_wall_time)
+            if total_generation_wall_time > 0
+            else 0.0
+        ),
+        "eval_length_mode": getattr(args, "eval_length_mode", "fixed"),
+        "eval_answer_tokens": get_eval_answer_tokens(args),
+        "model_total_parameters": model_info["total_parameters"],
+        "model_trainable_parameters": model_info["trainable_parameters"],
+        "model_total_parameters_millions": model_info["total_parameters_millions"],
     }
 
     if save_predictions_path:
@@ -1602,6 +2177,27 @@ def evaluate_generation(
             for row in predictions:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+        summary_path = Path(save_predictions_path).with_suffix(".summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "model_info": model_info,
+                    "dataset_metrics": metrics,
+                    "example_id_format": "<dataset>_<split>_<zero-padded-index>",
+                    "predictions_file": str(Path(save_predictions_path).name),
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    print(
+        f"[{name}] total={total} accuracy={metrics['accuracy']:.4f} "
+        f"dataset_wall={dataset_wall_time:.3f}s "
+        f"generation_total={total_generation_wall_time:.3f}s "
+        f"avg_answer={average_generation_time * 1000.0:.3f}ms "
+        f"params={model_info['total_parameters_millions']:.2f}M"
+    )
     return metrics
 
 
@@ -1616,6 +2212,11 @@ def train(args) -> None:
         raise ValueError("diffusion_eval_noise must be in (0, 1].")
     if not 0.0 <= args.diffusion_self_conditioning_probability <= 1.0:
         raise ValueError("diffusion_self_conditioning_probability must be in [0, 1].")
+    if not uses_oracle_answer_length(args) and get_eval_answer_tokens(args) >= args.max_seq_len:
+        raise ValueError(
+            "Fixed-length evaluation requires eval_answer_tokens < max_seq_len "
+            f"(got eval_answer_tokens={get_eval_answer_tokens(args)}, max_seq_len={args.max_seq_len})."
+        )
 
     token = os.environ.get(args.hf_token_env, None)
     if token:
@@ -1626,6 +2227,15 @@ def train(args) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = load_model(args, tokenizer).to(device)
+    model_info = get_model_parameter_stats(model, args.model_type_resolved)
+    print(
+        "Model parameters: "
+        f"total={model_info['total_parameters']:,} "
+        f"({model_info['total_parameters_millions']:.2f}M), "
+        f"trainable={model_info['trainable_parameters']:,} "
+        f"({model_info['trainable_parameters_millions']:.2f}M), "
+        f"parameter_memory={model_info['parameter_memory_mib']:.2f} MiB"
+    )
 
     if is_diffusion_lm_type(args.model_type_resolved):
         model_canvas_length = int(getattr(model.config, "canvas_length", args.diffusion_canvas_length))
@@ -1700,6 +2310,8 @@ def train(args) -> None:
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.output_dir) / "args.json", "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
+    with open(Path(args.output_dir) / "model_info.json", "w", encoding="utf-8") as f:
+        json.dump(model_info, f, indent=2, ensure_ascii=False)
 
     autocast_dtype = get_autocast_dtype(args.mixed_precision)
     use_autocast = autocast_dtype is not None and device.type == "cuda"
@@ -1813,7 +2425,7 @@ def train(args) -> None:
         metrics={"global_step": global_step},
     )
 
-    final_metrics = {}
+    final_metrics = {"model_info": model_info}
     if args.use_gsm8k and len(gsm_test_ds) > 0:
         final_metrics["gsm8k_test"] = evaluate_generation(
             model,
@@ -1849,16 +2461,36 @@ def train(args) -> None:
 # -----------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune TRLM, GPT-2, Gemma4-Text, or DiffusionGemma on GSM8K + SVAMP.")
+    parser = argparse.ArgumentParser(description="Fine-tune TRLM, GPT-2, Gemma4-Text, Mamba2, or DiffusionGemma on GSM8K + SVAMP.")
 
-    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2", "gemma4_text", "diffusion_gemma"])
-    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt or an HF GPT-2/Gemma4-Text/DiffusionGemma checkpoint directory/file")
+    parser.add_argument("--model_type", type=str, default="auto", choices=["auto", "trlm", "gpt2", "gemma4_text", "mamba2", "diffusion_gemma"])
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="TRLM .pt or an HF GPT-2/Gemma4-Text/Mamba2/DiffusionGemma checkpoint directory/file")
     parser.add_argument("--tokenizer_name", type=str, default="DogaOytc/TRLM-tokenizer")
     parser.add_argument("--output_dir", type=str, default="checkpoints_math")
     parser.add_argument("--hf_token_env", type=str, default="HF_TOKEN")
 
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--max_answer_tokens", type=int, default=384)
+    parser.add_argument(
+        "--eval_length_mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "oracle"],
+        help=(
+            "Generation evaluation length protocol. 'fixed' uses the same fixed "
+            "answer canvas for every example; 'oracle' reproduces gold answer "
+            "length decoding for ablation only."
+        ),
+    )
+    parser.add_argument(
+        "--eval_answer_tokens",
+        type=int,
+        default=-1,
+        help=(
+            "Fixed answer canvas for generation evaluation. Defaults to "
+            "max_answer_tokens when <=0."
+        ),
+    )
     parser.add_argument("--target_mode", type=str, default="reasoning", choices=["reasoning", "final_only"])
     parser.add_argument("--pad_to_max_seq_len", action="store_true")
 
@@ -1891,8 +2523,6 @@ def parse_args():
     # TRLM-specific inference/training knobs. Ignored in GPT-2 mode except kept in args for logging.
     parser.add_argument("--recursion_steps", type=int, default=8)
     parser.add_argument("--use_short_consistency", action="store_true")
-    parser.add_argument("--gen_iterations", type=int, default=8)
-    parser.add_argument("--remask_ratio_start", type=float, default=0.7)
 
     # GPT-2 loading/generation knobs.
     parser.add_argument("--gpt2_config_path", type=str, default=None, help="Optional GPT-2 config path or directory. Defaults to checkpoint dir/config.json if present.")
@@ -1902,10 +2532,16 @@ def parse_args():
     parser.add_argument("--gpt2_activation", type=str, default="gelu_new")
     parser.add_argument("--gpt2_dropout", type=float, default=0.0)
     parser.add_argument("--gpt2_layer_norm_epsilon", type=float, default=1e-5)
-    parser.add_argument("--gpt2_max_new_tokens", type=int, default=-1, help="If >0, fixed generation length for GPT-2. Otherwise uses max gold answer length in the batch.")
+    parser.add_argument("--gpt2_max_new_tokens", type=int, default=-1, help="If >0, override GPT-2 generation length. Otherwise uses fixed eval_answer_tokens, except in oracle eval mode.")
     parser.add_argument("--gpt2_extra_new_tokens", type=int, default=0)
-    parser.add_argument("--gpt2_decode_gold_length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gpt2_decode_gold_length", action=argparse.BooleanOptionalAction, default=True, help="Only applies when --eval_length_mode oracle.")
     parser.add_argument("--allow_resize_token_embeddings", action="store_true")
+
+    # Mamba2 checkpoint loading and generation knobs.
+    parser.add_argument("--mamba2_config_path", type=str, default=None, help="Optional Mamba2 config directory. Defaults to checkpoint directory.")
+    parser.add_argument("--mamba2_max_new_tokens", type=int, default=-1, help="If >0, override Mamba2 generation length. Otherwise uses fixed eval_answer_tokens, except in oracle eval mode.")
+    parser.add_argument("--mamba2_extra_new_tokens", type=int, default=0)
+    parser.add_argument("--mamba2_decode_gold_length", action=argparse.BooleanOptionalAction, default=True, help="Only applies when --eval_length_mode oracle.")
 
     # Gemma4-Text loading knobs. These are only used when config.json is absent.
     parser.add_argument("--gemma_config_path", type=str, default=None, help="Optional Gemma4-Text config path or directory. Defaults to checkpoint dir/config.json if present.")
@@ -1939,9 +2575,9 @@ def parse_args():
     parser.add_argument("--diffusion_t_max", type=float, default=0.8)
     parser.add_argument("--diffusion_stability_threshold", type=int, default=1)
     parser.add_argument("--diffusion_confidence_threshold", type=float, default=0.005)
-    parser.add_argument("--diffusion_max_new_tokens", type=int, default=-1, help="If >0, fixed generated length. Otherwise uses the batch's maximum gold answer length.")
+    parser.add_argument("--diffusion_max_new_tokens", type=int, default=-1, help="If >0, override DiffusionGemma generated length. Otherwise uses fixed eval_answer_tokens, except in oracle eval mode.")
     parser.add_argument("--diffusion_extra_new_tokens", type=int, default=0)
-    parser.add_argument("--diffusion_decode_gold_length", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--diffusion_decode_gold_length", action=argparse.BooleanOptionalAction, default=True, help="Only applies when --eval_length_mode oracle.")
     parser.add_argument("--diffusion_eval_seed", type=int, default=123456789)
 
     parser.add_argument("--answer_tolerance", type=float, default=1e-4)
@@ -1949,7 +2585,12 @@ def parse_args():
     parser.add_argument("--eval_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument("--max_eval_batches", type=int, default=-1)
-    parser.add_argument("--max_saved_predictions", type=int, default=2000)
+    parser.add_argument(
+        "--max_saved_predictions",
+        type=int,
+        default=-1,
+        help="Maximum predictions to save per test set. Use -1 (default) to save every answer and its latency.",
+    )
 
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
