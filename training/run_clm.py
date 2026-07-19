@@ -480,6 +480,9 @@ def apply_config_overrides(config, overrides: str) -> None:
 
     text_config = _get_text_config_for_overrides(config)
 
+    # Present in Gemma4Text configs in some Transformers versions, but not in
+    # DiffusionGemmaTextConfig. In your command it is set to 0, so skipping it
+    # preserves the default behavior.
     # These are compatibility overrides used by Gemma4Text/Gemma causal-LM configs
     # in some Transformers versions, but they are not exposed by
     # DiffusionGemmaTextConfig. If they are absent, skipping them preserves the
@@ -560,6 +563,62 @@ def is_diffusion_gemma_config(config) -> bool:
     return getattr(config, "model_type", None) == "diffusion_gemma"
 
 
+def is_mamba2_config(config) -> bool:
+    """Return True for a Hugging Face Mamba2Config."""
+    return getattr(config, "model_type", None) == "mamba2"
+
+
+def normalize_mamba2_config(config) -> None:
+    """Validate and normalize scratch Mamba-2 configurations.
+
+    Hugging Face Mamba2 requires ``hidden_size * expand`` to equal
+    ``num_heads * head_dim``. Keeping this check here produces a clear error
+    before the large model is allocated. Cache is disabled for train/eval
+    forward passes; generation can still explicitly request it later.
+    """
+    if not is_mamba2_config(config):
+        return
+
+    hidden_size = int(config.hidden_size)
+    expand = int(config.expand)
+    num_heads = int(config.num_heads)
+    head_dim = int(config.head_dim)
+    inner_size = hidden_size * expand
+
+    if inner_size != num_heads * head_dim:
+        raise ValueError(
+            "Invalid Mamba-2 dimensions: hidden_size * expand must equal "
+            "num_heads * head_dim, got "
+            f"{hidden_size} * {expand} = {inner_size}, but "
+            f"{num_heads} * {head_dim} = {num_heads * head_dim}."
+        )
+
+    if int(config.n_groups) < 1:
+        raise ValueError(f"Mamba-2 n_groups must be >= 1, got {config.n_groups}.")
+    if int(config.state_size) < 1:
+        raise ValueError(f"Mamba-2 state_size must be >= 1, got {config.state_size}.")
+    if int(config.chunk_size) < 1:
+        raise ValueError(f"Mamba-2 chunk_size must be >= 1, got {config.chunk_size}.")
+
+    # No cache is required for full-sequence language-model training or
+    # validation. This avoids retaining recurrent states during evaluation.
+    config.use_cache = False
+
+    logger.info(
+        "Normalized Mamba-2 config: hidden=%d, layers=%d, inner=%d, "
+        "heads=%d, head_dim=%d, state=%d, groups=%d, chunk=%d, tied=%s",
+        hidden_size,
+        int(config.num_hidden_layers),
+        inner_size,
+        num_heads,
+        head_dim,
+        int(config.state_size),
+        int(config.n_groups),
+        int(config.chunk_size),
+        bool(config.tie_word_embeddings),
+    )
+
+
 def patch_diffusion_gemma_text_only_encoder() -> None:
     """
     Patch Transformers 5.13.x so DiffusionGemma can be instantiated with
@@ -610,6 +669,17 @@ def build_model_from_config(config, model_args):
     it is a block-diffusion model, not a standard left-to-right causal LM.
     It must be instantiated with DiffusionGemmaForBlockDiffusion.
     """
+    if is_mamba2_config(config):
+        try:
+            from transformers import Mamba2ForCausalLM
+        except ImportError as exc:
+            raise ImportError(
+                "Mamba2ForCausalLM could not be imported. Install a Transformers "
+                "version with Mamba-2 support (the project currently uses 5.13.x)."
+            ) from exc
+        logger.info("Instantiating Mamba2ForCausalLM from scratch.")
+        return Mamba2ForCausalLM(config)
+
     if is_diffusion_gemma_config(config):
         config.vision_config = None
         patch_diffusion_gemma_text_only_encoder()
@@ -629,7 +699,26 @@ def build_model_from_config(config, model_args):
 
 
 def load_model_from_pretrained(model_args, config, dtype):
-    """Load pretrained model, including DiffusionGemma checkpoints."""
+    """Load pretrained model, including Mamba-2 and DiffusionGemma checkpoints."""
+    if is_mamba2_config(config):
+        try:
+            from transformers import Mamba2ForCausalLM
+        except ImportError as exc:
+            raise ImportError(
+                "Mamba2ForCausalLM could not be imported. Install a Transformers "
+                "version with Mamba-2 support."
+            ) from exc
+        logger.info("Loading Mamba2ForCausalLM checkpoint: %s", model_args.model_name_or_path)
+        return Mamba2ForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+            dtype=dtype,
+        )
+
     if is_diffusion_gemma_config(config):
         config.vision_config = None
         patch_diffusion_gemma_text_only_encoder()
@@ -703,6 +792,14 @@ def normalize_gemma4_config(config) -> None:
     if model_type == "diffusion_gemma":
         configure_diffusion_gemma_text_only(config)
 
+    # DiffusionGemmaTextConfig in the current Transformers build exposes MoE
+    # fields but leaves them as None when the top-level DiffusionGemmaConfig is
+    # created from scratch. The modeling code constructs a router with
+    # nn.Linear(hidden_size, num_experts), so num_experts must be an integer.
+    # For a dense 75M-class baseline, one expert is the safest equivalent: it
+    # keeps the model close to a standard dense Gemma block while satisfying the
+    # block-diffusion implementation. Users can override these explicitly with
+    # num_experts=..., top_k_experts=..., moe_intermediate_size=... if desired.
     if model_type == "diffusion_gemma":
         if hasattr(target_config, "num_experts") and getattr(target_config, "num_experts", None) is None:
             logger.warning(
@@ -1281,6 +1378,7 @@ def main():
             logger.info(f"New config: {config}")
 
     normalize_gemma4_config(config)
+    normalize_mamba2_config(config)
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -1331,6 +1429,19 @@ def main():
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+
+    if is_mamba2_config(config):
+        # The fused Mamba-2 CUDA path is selected only outside TorchDynamo.
+        # Compiling the model therefore sends this workload through the slower
+        # pure-PyTorch scan path instead of mamba-ssm/causal-conv1d kernels.
+        training_args.use_cache = False
+        model.config.use_cache = False
+        if training_args.torch_compile:
+            logger.warning(
+                "Disabling torch_compile for Mamba-2 so the fused mamba-ssm and "
+                "causal-conv1d training kernels can be used."
+            )
+            training_args.torch_compile = False
 
     if is_diffusion_gemma_config(config):
         # DiffusionGemma always uses its encoder KV cache and rejects an explicit
