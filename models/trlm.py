@@ -50,6 +50,7 @@ class ReasoningModule(nn.Module):
 
         # Projects the concatenated x, y, and z states back to hidden_dim.
         self.combiner = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
+        self.use_trajectory_conditioning = getattr(config, "use_trajectory_conditioning", True)
 
         self.layers = nn.ModuleList([
             TransformerBlock(
@@ -63,7 +64,7 @@ class ReasoningModule(nn.Module):
                 swiglu_hidden_act=config.swiglu_hidden_act,
                 attn_dropout=config.attn_dropout,
                 transformer_dropout=config.transformer_dropout,
-                use_adaln=True
+                use_adaln=self.use_trajectory_conditioning
             ) for _ in range(config.num_layers)
         ])
 
@@ -120,13 +121,15 @@ class ReasoningModule(nn.Module):
 
         # Latent Recursion Loop: refine z 'step' times
         for dt in steps:
-            dt_base = torch.ones_like(ti) * dt
-            te = self.time_embedder(ti)
-            dte = self.dt_embedder(dt_base)
-            c = te + dte
+            cond = None
+            if self.use_trajectory_conditioning:
+                dt_base = torch.ones_like(ti) * dt
+                te = self.time_embedder(ti)
+                dte = self.dt_embedder(dt_base)
+                c = te + dte
 
-            # calculate adaln conditioning
-            cond = self.cond_mlp(c)  # [B, 4*H]
+                # calculate adaln conditioning
+                cond = self.cond_mlp(c)  # [B, 4*H]
 
             # Combine x, y, z
             combined = torch.cat([x, y, z], dim=-1)
@@ -162,6 +165,7 @@ class TRLM(nn.Module):
         self.short_lm_weight = getattr(config, "short_lm_weight", 0.1)
         self.consistency_weight = getattr(config, "consistency_weight", 0.1)
         self.max_recursions = getattr(config, "max_recursions", 8)
+        self.use_trajectory_conditioning = getattr(config, "use_trajectory_conditioning", True)
 
         self.reasoning_module = ReasoningModule(config)
 

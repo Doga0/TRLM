@@ -500,6 +500,23 @@ class TRLMTrainer:
 
         return teacher_trajectory, student_trajectory
 
+    def sample_random_recursion_trajectory(self):
+        """
+        Return one uniform recursion trajectory with a random depth.
+
+        This is used when trajectory conditioning is disabled: the model is
+        trained with one randomly sampled recursion depth, without a separate
+        long/short teacher-student pair.
+        """
+
+        max_steps = max(1, int(getattr(self.config, "max_recursions", 8)))
+        min_steps = max(1, int(getattr(self.config, "min_recursions", 1)))
+        min_steps = min(min_steps, max_steps)
+
+        recursion_steps = random.randint(min_steps, max_steps)
+
+        return [1.0 / recursion_steps] * recursion_steps
+
     def train_step(self, batch: Dict[str, torch.Tensor], micro_step_idx: int):
         """
         Executes a single training iteration: forward pass, backward pass, and 
@@ -512,7 +529,11 @@ class TRLMTrainer:
         attention_mask = batch.get("attention_mask", None)
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):
-            long_trajectory, short_trajectory = self.sample_teacher_student_trajectories()
+            if getattr(self.config, "use_trajectory_conditioning", True):
+                train_trajectory, short_trajectory = self.sample_teacher_student_trajectories()
+            else:
+                train_trajectory = self.sample_random_recursion_trajectory()
+                short_trajectory = None
             
             (
                 logits,
@@ -525,7 +546,7 @@ class TRLMTrainer:
             ) = self.model(
                 masked_input_ids=masked_input_ids,
                 labels=labels,
-                long_steps=long_trajectory,
+                long_steps=train_trajectory,
                 short_steps=short_trajectory,
             )
 
@@ -969,11 +990,17 @@ class TRLMTrainer:
             leave=False
         )
 
+        eval_logging_steps = max(1, int(getattr(self.config, "eval_logging_steps", 50)))
         max_recursions = self.config.max_recursions
         long_steps = [1.0 / max_recursions] * max_recursions
 
         short_len = random.randint(1, max_recursions - 1) if max_recursions > 1 else 1
         short_steps = [1.0 / short_len] * short_len
+        use_trajectory_conditioning = getattr(
+            self.config,
+            "use_trajectory_conditioning",
+            True,
+        )
 
         try:
             for batch_idx, batch in enumerate(pbar):
@@ -996,25 +1023,34 @@ class TRLMTrainer:
                         short_steps=None
                     )
 
-                    # 2. Short trajectory eval 
-                    logits_short, loss_short, lm_loss_short, _, _, depth_short, y_short = self.model(
-                        masked_input_ids=masked_input_ids,
-                        labels=labels,
-                        long_steps=short_steps,  
-                        short_steps=None
-                    )
+                    if use_trajectory_conditioning:
+                        # 2. Short trajectory eval
+                        logits_short, loss_short, lm_loss_short, _, _, depth_short, y_short = self.model(
+                            masked_input_ids=masked_input_ids,
+                            labels=labels,
+                            long_steps=short_steps,
+                            short_steps=None
+                        )
+                    else:
+                        logits_short = None
+                        y_short = None
 
                 # Masked accuracy
                 mask = (labels != -100)
                 if mask.any():
                     acc_long = (logits_long.argmax(dim=-1)[mask] == labels[mask]).float().mean().item()
-                    acc_short = (logits_short.argmax(dim=-1)[mask] == labels[mask]).float().mean().item()
+                    if logits_short is not None:
+                        acc_short = (logits_short.argmax(dim=-1)[mask] == labels[mask]).float().mean().item()
+                    else:
+                        acc_short = acc_long
                 else:
                     acc_long = 0.0
                     acc_short = 0.0
 
-                # Consistency MSE
-                consistency = F.mse_loss(y_long, y_short).item()
+                if y_short is not None:
+                    consistency = F.mse_loss(y_long, y_short).item()
+                else:
+                    consistency = 0.0
 
                 total_val_loss += loss_long.item()
                 total_lm_loss_long += lm_loss_long.item()
@@ -1023,11 +1059,32 @@ class TRLMTrainer:
                 total_consistency += consistency
                 total_depth += depth_long
 
-                pbar.set_postfix({
-                    'val_loss': f"{loss_long.item():.4f}",
-                    'acc_long': f"{acc_long:.3f}",
-                    'acc_short': f"{acc_short:.3f}"
-                })
+                num_seen_batches = batch_idx + 1
+                if (
+                    num_seen_batches % eval_logging_steps == 0
+                    or num_seen_batches >= self.config.eval_steps
+                ):
+                    
+                    pbar.set_postfix({
+                        'val_loss': f"{loss_long.item():.4f}",
+                        'acc_long': f"{acc_long:.3f}",
+                        'acc_short': f"{acc_short:.3f}"
+                    })
+
+                    avg_lm_loss_so_far = total_lm_loss_long / num_seen_batches
+                    eval_ppl_so_far = torch.exp(
+                        torch.tensor(min(avg_lm_loss_so_far, 20.0))
+                    ).item()
+
+                    self.logger.eval(
+                        f"Eval Batch {num_seen_batches}/{self.config.eval_steps} | "
+                        f"Loss: {total_val_loss / num_seen_batches:.4f} | "
+                        f"MaskedPerplexity: {eval_ppl_so_far:.2f} | "
+                        f"AccLong: {total_acc_long / num_seen_batches:.4f} | "
+                        f"AccShort: {total_acc_short / num_seen_batches:.4f} | "
+                        f"Consistency: {total_consistency / num_seen_batches:.4f} | "
+                        f"Depth: {total_depth / num_seen_batches:.2f}"
+                    )
 
             num_batches = batch_idx + 1 
 
