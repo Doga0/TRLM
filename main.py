@@ -1,5 +1,6 @@
 import dotenv
 import os
+import argparse
 import torch
 from torch.utils.data import DataLoader
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -19,6 +20,39 @@ from data.dataset import (
     MixedPretrainDataset
 )
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Pretrain TRLM.")
+    parser.add_argument(
+        "--use-trajectory-conditioning",
+        dest="use_trajectory_conditioning",
+        action="store_true",
+        default=None,
+        help="Enable trajectory time/step conditioning in TRLM.",
+    )
+    parser.add_argument(
+        "--no-trajectory-conditioning",
+        dest="use_trajectory_conditioning",
+        action="store_false",
+        help="Disable trajectory time/step conditioning while keeping random recursion training.",
+    )
+    parser.add_argument(
+        "--max-recursions",
+        type=int,
+        default=None,
+        help="Maximum recursion count used by random teacher/student recursion training.",
+    )
+    parser.add_argument(
+        "--min-recursions",
+        type=int,
+        default=None,
+        help="Minimum recursion count used by random teacher recursion sampling.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+
 dotenv.load_dotenv()
 token = os.environ.get('HF_TOKEN')
 login(token=token)
@@ -35,6 +69,35 @@ config = TRLMConfig()
 
 config.vocab_size = len(tokenizer)
 config.mask_token_id = tokenizer.mask_token_id
+
+if args.use_trajectory_conditioning is not None:
+    config.use_trajectory_conditioning = args.use_trajectory_conditioning
+
+if args.max_recursions is not None:
+    config.max_recursions = args.max_recursions
+
+if args.min_recursions is not None:
+    config.min_recursions = args.min_recursions
+
+if config.min_recursions < 1:
+    raise ValueError("min_recursions must be >= 1.")
+
+if config.min_recursions > config.max_recursions:
+    raise ValueError("min_recursions must be <= max_recursions.")
+
+if config.use_trajectory_conditioning and config.max_recursions < 2:
+    raise ValueError("max_recursions must be >= 2 for long/short trajectory training.")
+
+if not config.use_trajectory_conditioning and config.max_recursions < 1:
+    raise ValueError("max_recursions must be >= 1 for random recursion training.")
+
+print(
+    "TRLM recursion config | "
+    f"trajectory_conditioning={config.use_trajectory_conditioning} | "
+    f"training_mode={'long_short' if config.use_trajectory_conditioning else 'random_single'} | "
+    f"min_recursions={config.min_recursions} | "
+    f"max_recursions={config.max_recursions}"
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = TRLM(config=config)
