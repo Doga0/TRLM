@@ -306,126 +306,55 @@ class TRLM(nn.Module):
     def generate(
         self,
         masked_input_ids: torch.Tensor,
-        num_iterations: int = 8,
         recursion_steps: int | None = None,
-        temperature: float = 0.0,
-        top_k: int | None = None,
-        do_sample: bool = False,
-        remask_ratio_start: float = 0.7,
-        remask_ratio_end: float = 0.0,
         forbid_mask_token: bool = True,
         forbid_token_ids: list[int] | None = None,
         return_confidence: bool = False,
     ):
-        """
-
-        This function fills only the positions that are already equal to mask_token_id.
-        All non-mask tokens are preserved exactly.
-
-        Best use:
-            input:  "The capital of France is <|mask|>."
-            output: "The capital of France is Paris."
-        """
         self.eval()
-
-        device = masked_input_ids.device
-        current_ids = masked_input_ids.clone()
-
-        original_mask = current_ids.eq(self.mask_token_id)
-
-        if not original_mask.any():
-            if return_confidence:
-                return current_ids, torch.ones_like(current_ids, dtype=torch.float32)
-            return current_ids
 
         if recursion_steps is None:
             recursion_steps = self.max_recursions
 
         recursion_steps = max(1, int(recursion_steps))
-        inner_steps = [1.0 / recursion_steps] * recursion_steps
+        steps = [1.0 / recursion_steps] * recursion_steps
 
-        if forbid_token_ids is None:
-            forbid_token_ids = []
+        logits, *_ = self.forward(
+            masked_input_ids=masked_input_ids,
+            labels=None,
+            long_steps=steps,
+            short_steps=None,
+        )
+
+        forbidden = list(forbid_token_ids or [])
 
         if forbid_mask_token:
-            forbid_token_ids = list(forbid_token_ids) + [self.mask_token_id]
+            forbidden.append(self.mask_token_id)
 
-        last_confidence = torch.zeros_like(current_ids, dtype=torch.float32)
+        logits = self._filter_generation_logits(
+            logits=logits,
+            temperature=0.0,
+            top_k=None,
+            forbid_token_ids=forbidden,
+        )
 
-        for iteration in range(num_iterations):
-            logits, *_ = self.forward(
-                masked_input_ids=current_ids,
-                labels=None,
-                long_steps=inner_steps,
-                short_steps=None,
-            )
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        confidence, predicted_ids = probabilities.max(dim=-1)
 
-            logits = self._filter_generation_logits(
-                logits=logits,
-                temperature=temperature,
-                top_k=top_k,
-                forbid_token_ids=forbid_token_ids,
-            )
+        output_ids = masked_input_ids.clone()
+        answer_mask = masked_input_ids.eq(self.mask_token_id)
 
-            probs = torch.softmax(logits, dim=-1)
-
-            if do_sample:
-                flat_probs = probs.reshape(-1, probs.size(-1))
-                sampled_ids = torch.multinomial(flat_probs, num_samples=1)
-                predicted_ids = sampled_ids.view(current_ids.shape)
-
-                confidence = probs.gather(
-                    dim=-1,
-                    index=predicted_ids.unsqueeze(-1),
-                ).squeeze(-1)
-            else:
-                confidence, predicted_ids = probs.max(dim=-1)
-
-            # Sadece orijinal mask pozisyonlarını doldur.
-            current_ids[original_mask] = predicted_ids[original_mask]
-            last_confidence[original_mask] = confidence[original_mask]
-
-            if iteration == num_iterations - 1:
-                break
-
-            progress = (iteration + 1) / max(1, num_iterations - 1)
-            remask_ratio = remask_ratio_start + progress * (
-                remask_ratio_end - remask_ratio_start
-            )
-            remask_ratio = max(0.0, min(1.0, float(remask_ratio)))
-
-            remask = torch.zeros_like(original_mask)
-
-            # Her batch elemanı için düşük güvenli mask pozisyonlarını tekrar maskele.
-            for b in range(current_ids.size(0)):
-                mask_positions = torch.nonzero(original_mask[b], as_tuple=False).squeeze(-1)
-
-                if mask_positions.numel() == 0:
-                    continue
-
-                num_to_remask = int(round(mask_positions.numel() * remask_ratio))
-
-                if num_to_remask <= 0:
-                    continue
-
-                num_to_remask = min(num_to_remask, mask_positions.numel())
-
-                conf_b = last_confidence[b, mask_positions]
-                low_conf_local = torch.topk(
-                    conf_b,
-                    k=num_to_remask,
-                    largest=False,
-                ).indices
-
-                low_conf_positions = mask_positions[low_conf_local]
-                remask[b, low_conf_positions] = True
-
-            current_ids[remask] = self.mask_token_id
+        output_ids[answer_mask] = predicted_ids[answer_mask]
 
         if return_confidence:
-            return current_ids, last_confidence
+            output_confidence = torch.ones_like(
+                masked_input_ids,
+                dtype=torch.float32,
+            )
+            output_confidence[answer_mask] = confidence[answer_mask]
+            return output_ids, output_confidence
 
-        return current_ids
+        return output_ids
         
     def num_parameters(self, trainable_only: bool = True) -> int:
         """Count model parameters."""
